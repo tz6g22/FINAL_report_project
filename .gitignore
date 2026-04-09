@@ -1,0 +1,11 @@
+.venv/
+.codex
+__pycache__
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.json
+*.jsonl
+*.png
