@@ -13,4 +13,4 @@ __pycache__
 example/
 mini_gpt_attnres_runs/
 =======
-
+.pytest_cache
