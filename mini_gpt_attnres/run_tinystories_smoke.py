@@ -58,7 +58,6 @@ def build_smoke_experiment(args: argparse.Namespace, out_dir: Path) -> Experimen
             device=args.device,
             num_workers=args.num_workers,
             out_dir=str(out_dir / "standard"),
-            log_sample_losses=not args.disable_sample_loss_log,
         ),
     )
 
@@ -84,11 +83,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument(
-        "--disable_sample_loss_log",
-        action="store_true",
-        help="Disable per-batch sample loss printouts.",
-    )
     parser.add_argument(
         "--run_mode",
         type=str,
@@ -135,12 +129,14 @@ def main() -> None:
     plots: dict[str, str] = {}
 
     for model_type in models_to_run:
+        print(f"[runner] preparing model={model_type}", flush=True)
         experiment = deepcopy(base_experiment)
         experiment.model.model_type = model_type
         experiment.train.out_dir = str(root_dir / model_type)
         train_summary = train_model(experiment)
         train_summaries[model_type] = train_summary
 
+        print(f"[runner] evaluating model={model_type}", flush=True)
         eval_metrics = evaluate_checkpoint(
             checkpoint_path=train_summary["checkpoint_path"],
             eval_batches=args.eval_batches,

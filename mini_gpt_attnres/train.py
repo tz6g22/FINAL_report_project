@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, Iterator, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .config import ExperimentConfig, default_experiment
 from .data import build_dataloaders
@@ -32,24 +31,13 @@ def cycle_dataloader(dataloader: torch.utils.data.DataLoader) -> Iterator[Tuple[
 
 
 def append_jsonl(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload) + "\n")
 
 
 def batch_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return float((logits.argmax(dim=-1) == targets).float().mean().item())
-
-
-def batch_sample_losses(logits: torch.Tensor, targets: torch.Tensor) -> list[float]:
-    with torch.no_grad():
-        vocab_size = logits.size(-1)
-        token_losses = F.cross_entropy(
-            logits.detach().reshape(-1, vocab_size),
-            targets.detach().reshape(-1),
-            reduction="none",
-        )
-        sample_losses = token_losses.view(targets.size(0), targets.size(1)).mean(dim=1)
-    return [float(v) for v in sample_losses.cpu().tolist()]
 
 
 def save_checkpoint(
@@ -60,6 +48,7 @@ def save_checkpoint(
     model_type: str,
     step: int,
 ) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     experiment_dict = experiment.to_dict()
     checkpoint = {
         "step": step,
@@ -90,7 +79,7 @@ def train_model(
     set_seed(experiment.train.seed)
     device = resolve_device(experiment.train.device)
 
-    output_dir = Path(experiment.train.out_dir)
+    output_dir = Path(experiment.train.out_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "metrics.jsonl"
     log_path.write_text("", encoding="utf-8")
@@ -112,6 +101,12 @@ def train_model(
         weight_decay=experiment.train.weight_decay,
     )
 
+    print(
+        f"[train][{model_type}] start training: steps={experiment.train.max_steps} "
+        f"batch_size={experiment.train.batch_size} device={device}",
+        flush=True,
+    )
+
     final_train_loss = None
     final_val_metrics: Dict[str, float] | None = None
     for step in range(1, experiment.train.max_steps + 1):
@@ -130,7 +125,6 @@ def train_model(
 
         final_train_loss = float(loss.item())
         train_acc = batch_accuracy(logits, targets)
-        sample_losses = batch_sample_losses(logits, targets) if experiment.train.log_sample_losses else None
 
         append_jsonl(
             log_path,
@@ -146,9 +140,6 @@ def train_model(
             f"[train][{model_type}] step {step}/{experiment.train.max_steps} "
             f"loss={final_train_loss:.6f} acc={train_acc:.4f}"
         )
-        if sample_losses is not None:
-            sample_str = ", ".join(f"{v:.6f}" for v in sample_losses)
-            message += f" sample_losses=[{sample_str}]"
         print(message, flush=True)
 
         if step % experiment.train.eval_interval == 0 or step == experiment.train.max_steps:
@@ -199,6 +190,14 @@ def train_model(
     }
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    val_loss = summary["final_val_loss"]
+    val_loss_str = "None" if val_loss is None else f"{val_loss:.6f}"
+    print(
+        f"[train][{model_type}] finished training: "
+        f"final_train_loss={summary['final_train_loss']:.6f} "
+        f"final_val_loss={val_loss_str}",
+        flush=True,
+    )
     return summary
 
 
@@ -210,11 +209,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="cpu, cuda, or auto.")
     parser.add_argument("--seed", type=int, default=None, help="Override random seed.")
     parser.add_argument("--max_steps", type=int, default=None, help="Override max training steps.")
-    parser.add_argument(
-        "--disable_sample_loss_log",
-        action="store_true",
-        help="Disable per-batch sample loss printouts.",
-    )
     return parser.parse_args()
 
 
@@ -232,8 +226,6 @@ def main() -> None:
         experiment.train.seed = args.seed
     if args.max_steps is not None:
         experiment.train.max_steps = args.max_steps
-    if args.disable_sample_loss_log:
-        experiment.train.log_sample_losses = False
 
     summary = train_model(experiment)
     print(json.dumps(summary, indent=2))

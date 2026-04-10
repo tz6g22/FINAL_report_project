@@ -70,7 +70,6 @@ class TrainConfig:
     out_dir: str = "runs/default"
     show_progress: bool = True
     log_every_step: bool = True
-    log_sample_losses: bool = True
 
 
 @dataclass

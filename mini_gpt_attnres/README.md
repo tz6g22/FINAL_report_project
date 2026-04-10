@@ -72,14 +72,7 @@ python -m mini_gpt_attnres.run_tinystories_smoke \
 By default this now shows:
 
 - tqdm progress for non-training data loading/tokenization
-- Per-step training logs with `loss/acc`
-- Current batch `sample_losses=[...]` for each training step
-
-If training logs are too verbose, add:
-
-```bash
---disable_sample_loss_log
-```
+- Per-step training logs with model name + `loss/acc`
 
 Run only one variant (useful on limited GPUs):
 
