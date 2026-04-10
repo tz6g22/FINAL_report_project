@@ -45,6 +45,8 @@ class DataConfig:
     train_texts: int | None = None
     val_texts: int | None = None
     block_stride: int = 256
+    use_token_cache: bool = True
+    token_cache_dir: str = "mini_gpt_attnres_cache/tinystories"
 
     def __post_init__(self) -> None:
         valid = {"random", "repeated_pattern", "retrieval", "tinystories"}
@@ -56,6 +58,8 @@ class DataConfig:
             raise ValueError("val_texts must be positive when provided.")
         if self.block_stride <= 0:
             raise ValueError("block_stride must be positive.")
+        if self.use_token_cache and not str(self.token_cache_dir).strip():
+            raise ValueError("token_cache_dir must be non-empty when use_token_cache is enabled.")
 
 
 @dataclass

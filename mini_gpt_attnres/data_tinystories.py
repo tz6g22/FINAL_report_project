@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Tuple
 
 import torch
@@ -19,17 +25,21 @@ from .config import DataConfig, ModelConfig
 class TokenBlockDataset(Dataset):
     """Causal-LM blocks from one contiguous token stream."""
 
-    def __init__(self, token_ids: list[int], block_size: int, stride: int) -> None:
+    def __init__(self, token_ids: list[int] | torch.Tensor, block_size: int, stride: int) -> None:
         super().__init__()
         self.block_size = block_size
         self.total_len = block_size + 1
-        if len(token_ids) < self.total_len:
+        token_count = int(token_ids.numel()) if torch.is_tensor(token_ids) else len(token_ids)
+        if token_count < self.total_len:
             raise ValueError(
-                f"Not enough tokens ({len(token_ids)}) for block_size={block_size}. "
+                f"Not enough tokens ({token_count}) for block_size={block_size}. "
                 "Increase train_texts/val_texts or lower block_size."
             )
-        self.tokens = torch.tensor(token_ids, dtype=torch.long)
-        max_start = len(token_ids) - self.total_len
+        if torch.is_tensor(token_ids):
+            self.tokens = token_ids.to(dtype=torch.long).view(-1).contiguous()
+        else:
+            self.tokens = torch.tensor(token_ids, dtype=torch.long)
+        max_start = token_count - self.total_len
         self.starts = list(range(0, max_start + 1, max(1, stride)))
         if not self.starts:
             self.starts = [0]
@@ -45,9 +55,114 @@ class TokenBlockDataset(Dataset):
 
 @dataclass
 class TinyStoriesAssets:
-    train_tokens: list[int]
-    val_tokens: list[int]
+    train_tokens: list[int] | torch.Tensor
+    val_tokens: list[int] | torch.Tensor
     vocab_size: int
+
+
+def _resolve_token_cache_path(data_config: DataConfig) -> Path:
+    base_dir = Path(data_config.token_cache_dir).expanduser()
+    if not base_dir.is_absolute():
+        project_root = Path(__file__).resolve().parents[1]
+        base_dir = project_root / base_dir
+    payload = {
+        "dataset_name": data_config.hf_dataset_name,
+        "tokenizer_name": data_config.tokenizer_name,
+        "text_field": data_config.text_field,
+        "train_texts": data_config.train_texts,
+        "val_texts": data_config.val_texts,
+    }
+    signature = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return base_dir / f"token_cache_{signature}.pt"
+
+
+def _load_cached_assets(path: Path, data_config: DataConfig, verbose: bool = True) -> TinyStoriesAssets | None:
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception as error:
+        if verbose:
+            print(f"[data] token cache load failed at {path}: {error}. Rebuilding cache.", flush=True)
+        return None
+
+    expected = {
+        "dataset_name": data_config.hf_dataset_name,
+        "tokenizer_name": data_config.tokenizer_name,
+        "text_field": data_config.text_field,
+        "train_texts": data_config.train_texts,
+        "val_texts": data_config.val_texts,
+    }
+    if payload.get("cache_identity") != expected:
+        return None
+
+    train_tokens = payload.get("train_tokens")
+    val_tokens = payload.get("val_tokens")
+    vocab_size = payload.get("vocab_size")
+    if train_tokens is None or val_tokens is None or vocab_size is None:
+        return None
+    if not torch.is_tensor(train_tokens):
+        train_tokens = torch.tensor(train_tokens, dtype=torch.long)
+    if not torch.is_tensor(val_tokens):
+        val_tokens = torch.tensor(val_tokens, dtype=torch.long)
+    if verbose:
+        print(f"[data] loaded token cache: {path}", flush=True)
+    return TinyStoriesAssets(train_tokens=train_tokens, val_tokens=val_tokens, vocab_size=int(vocab_size))
+
+
+def _save_cached_assets(path: Path, assets: TinyStoriesAssets, data_config: DataConfig, verbose: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache_identity = {
+        "dataset_name": data_config.hf_dataset_name,
+        "tokenizer_name": data_config.tokenizer_name,
+        "text_field": data_config.text_field,
+        "train_texts": data_config.train_texts,
+        "val_texts": data_config.val_texts,
+    }
+    train_tokens = assets.train_tokens
+    val_tokens = assets.val_tokens
+    if not torch.is_tensor(train_tokens):
+        train_tokens = torch.tensor(train_tokens, dtype=torch.long)
+    if not torch.is_tensor(val_tokens):
+        val_tokens = torch.tensor(val_tokens, dtype=torch.long)
+
+    payload = {
+        "cache_identity": cache_identity,
+        "train_tokens": train_tokens.cpu(),
+        "val_tokens": val_tokens.cpu(),
+        "vocab_size": int(assets.vocab_size),
+    }
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+    if verbose:
+        print(f"[data] saved token cache: {path}", flush=True)
+
+
+def _acquire_cache_lock(cache_path: Path, verbose: bool = True) -> tuple[int | None, Path]:
+    lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            return fd, lock_path
+        except FileExistsError:
+            if verbose:
+                print(f"[data] waiting for token cache lock: {lock_path}", flush=True)
+            time.sleep(0.5)
+
+
+def _release_cache_lock(fd: int | None, lock_path: Path) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _load_hf_split(dataset_name: str, split: str, verbose: bool = True):
@@ -104,6 +219,44 @@ def prepare_tinystories_assets(
 ) -> TinyStoriesAssets:
     """Load TinyStories and tokenize into train/val token streams."""
 
+    cache_path = _resolve_token_cache_path(data_config)
+    if data_config.use_token_cache:
+        cached = _load_cached_assets(cache_path, data_config=data_config, verbose=verbose)
+        if cached is not None:
+            if model_config.vocab_size != cached.vocab_size:
+                model_config.vocab_size = cached.vocab_size
+            return cached
+        lock_fd, lock_path = _acquire_cache_lock(cache_path, verbose=verbose)
+        try:
+            cached_after_lock = _load_cached_assets(cache_path, data_config=data_config, verbose=verbose)
+            if cached_after_lock is not None:
+                if model_config.vocab_size != cached_after_lock.vocab_size:
+                    model_config.vocab_size = cached_after_lock.vocab_size
+                return cached_after_lock
+            if verbose:
+                print("[data] token cache miss; building tokenized TinyStories assets...", flush=True)
+            assets = _prepare_tinystories_assets_uncached(
+                model_config=model_config,
+                data_config=data_config,
+                verbose=verbose,
+            )
+            _save_cached_assets(cache_path, assets=assets, data_config=data_config, verbose=verbose)
+            return assets
+        finally:
+            _release_cache_lock(lock_fd, lock_path)
+
+    return _prepare_tinystories_assets_uncached(
+        model_config=model_config,
+        data_config=data_config,
+        verbose=verbose,
+    )
+
+
+def _prepare_tinystories_assets_uncached(
+    model_config: ModelConfig,
+    data_config: DataConfig,
+    verbose: bool = True,
+) -> TinyStoriesAssets:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(data_config.tokenizer_name, use_fast=True)
@@ -156,11 +309,12 @@ def prepare_tinystories_assets(
     if model_config.vocab_size != vocab_size:
         model_config.vocab_size = vocab_size
 
-    return TinyStoriesAssets(
-        train_tokens=train_tokens,
-        val_tokens=val_tokens,
+    assets = TinyStoriesAssets(
+        train_tokens=torch.tensor(train_tokens, dtype=torch.long),
+        val_tokens=torch.tensor(val_tokens, dtype=torch.long),
         vocab_size=vocab_size,
     )
+    return assets
 
 
 def build_tinystories_dataloaders(
