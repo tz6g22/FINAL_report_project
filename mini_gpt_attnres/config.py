@@ -14,7 +14,7 @@ class ModelConfig:
 
     model_type: str = "standard"
     vocab_size: int = 64
-    block_size: int = 64
+    block_size: int = 256
     n_layer: int = 4
     n_head: int = 4
     n_embd: int = 128
@@ -32,9 +32,9 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    """Synthetic language-modeling dataset settings."""
+    """Dataset settings for synthetic tasks and TinyStories training."""
 
-    dataset_type: str = "repeated_pattern"
+    dataset_type: str = "tinystories"
     train_size: int = 1024
     val_size: int = 256
     pattern_length: int = 8
@@ -42,14 +42,20 @@ class DataConfig:
     hf_dataset_name: str = "roneneldan/TinyStories"
     text_field: str = "text"
     tokenizer_name: str = "gpt2"
-    train_texts: int = 2000
-    val_texts: int = 200
-    block_stride: int = 64
+    train_texts: int | None = None
+    val_texts: int | None = None
+    block_stride: int = 256
 
     def __post_init__(self) -> None:
         valid = {"random", "repeated_pattern", "retrieval", "tinystories"}
         if self.dataset_type not in valid:
             raise ValueError(f"dataset_type must be one of {sorted(valid)}.")
+        if self.train_texts is not None and self.train_texts <= 0:
+            raise ValueError("train_texts must be positive when provided.")
+        if self.val_texts is not None and self.val_texts <= 0:
+            raise ValueError("val_texts must be positive when provided.")
+        if self.block_stride <= 0:
+            raise ValueError("block_stride must be positive.")
 
 
 @dataclass
@@ -57,13 +63,13 @@ class TrainConfig:
     """Optimization and checkpointing settings."""
 
     batch_size: int = 32
-    max_steps: int = 200
-    eval_interval: int = 25
-    checkpoint_interval: int = 50
+    max_steps: int = 20000
+    eval_interval: int = 500
+    checkpoint_interval: int = 1000
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     grad_clip: float = 1.0
-    eval_batches: int = 10
+    eval_batches: int | None = None
     seed: int = 1234
     device: str = "auto"
     num_workers: int = 0
@@ -105,9 +111,9 @@ class ExperimentConfig:
 
 
 def default_experiment(model_type: str = "standard") -> ExperimentConfig:
-    """Return a small default config for smoke tests and toy runs."""
+    """Return the default TinyStories training configuration."""
 
     experiment = ExperimentConfig()
     experiment.model.model_type = model_type
-    experiment.train.out_dir = f"runs/{model_type}"
+    experiment.train.out_dir = f"mini_gpt_attnres_runs/{model_type}"
     return experiment

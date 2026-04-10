@@ -1,4 +1,4 @@
-"""TinyStories dataset pipeline for minimal smoke training."""
+"""TinyStories dataset pipeline for full training and evaluation."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Iterable, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - tqdm may be unavailable in minimal environments
@@ -49,20 +50,27 @@ class TinyStoriesAssets:
     vocab_size: int
 
 
-def _load_hf_split(dataset_name: str, split: str):
+def _load_hf_split(dataset_name: str, split: str, verbose: bool = True):
     from datasets import load_dataset
 
-    print(f"[data] loading dataset={dataset_name} split={split}", flush=True)
+    if verbose:
+        print(f"[data] loading dataset={dataset_name} split={split}", flush=True)
     return load_dataset(dataset_name, split=split)
 
 
-def _encode_texts(texts: Iterable[str], tokenizer, eos_token_id: int, desc: str) -> list[int]:
+def _encode_texts(
+    texts: Iterable[str],
+    tokenizer,
+    eos_token_id: int,
+    desc: str,
+    verbose: bool = True,
+) -> list[int]:
     token_ids: list[int] = []
     total = len(texts) if hasattr(texts, "__len__") else None
     iterator = texts
-    if tqdm is not None:
+    if verbose and tqdm is not None:
         iterator = tqdm(texts, total=total, desc=desc, unit="text", dynamic_ncols=True)
-    elif total is not None:
+    elif verbose and total is not None:
         print(f"[data] {desc}: 0/{total}", flush=True)
 
     for idx, text in enumerate(iterator, start=1):
@@ -84,13 +92,17 @@ def _encode_texts(texts: Iterable[str], tokenizer, eos_token_id: int, desc: str)
             continue
         token_ids.extend(encoded)
         token_ids.append(eos_token_id)
-        if tqdm is None and total is not None and (idx % 1000 == 0 or idx == total):
+        if verbose and tqdm is None and total is not None and (idx % 1000 == 0 or idx == total):
             print(f"[data] {desc}: {idx}/{total}", flush=True)
     return token_ids
 
 
-def prepare_tinystories_assets(model_config: ModelConfig, data_config: DataConfig) -> TinyStoriesAssets:
-    """Load TinyStories subset and tokenize into train/val token streams."""
+def prepare_tinystories_assets(
+    model_config: ModelConfig,
+    data_config: DataConfig,
+    verbose: bool = True,
+) -> TinyStoriesAssets:
+    """Load TinyStories and tokenize into train/val token streams."""
 
     from transformers import AutoTokenizer
 
@@ -99,16 +111,21 @@ def prepare_tinystories_assets(model_config: ModelConfig, data_config: DataConfi
     if eos_token_id is None:
         raise ValueError(f"Tokenizer {data_config.tokenizer_name} has no eos_token_id.")
 
-    train_split = f"train[:{data_config.train_texts}]"
+    train_split = "train" if data_config.train_texts is None else f"train[:{data_config.train_texts}]"
     try:
-        val_split = f"validation[:{data_config.val_texts}]"
-        val_raw = _load_hf_split(data_config.hf_dataset_name, val_split)
+        val_split = "validation" if data_config.val_texts is None else f"validation[:{data_config.val_texts}]"
+        val_raw = _load_hf_split(data_config.hf_dataset_name, val_split, verbose=verbose)
     except Exception:
-        offset = data_config.train_texts
+        if data_config.val_texts is None:
+            raise RuntimeError(
+                "Validation split is unavailable and val_texts is not set. "
+                "Provide --val_texts to carve a validation subset from train."
+            )
+        offset = 0 if data_config.train_texts is None else data_config.train_texts
         val_split = f"train[{offset}:{offset + data_config.val_texts}]"
-        val_raw = _load_hf_split(data_config.hf_dataset_name, val_split)
+        val_raw = _load_hf_split(data_config.hf_dataset_name, val_split, verbose=verbose)
 
-    train_raw = _load_hf_split(data_config.hf_dataset_name, train_split)
+    train_raw = _load_hf_split(data_config.hf_dataset_name, train_split, verbose=verbose)
     if data_config.text_field not in train_raw.column_names:
         raise ValueError(
             f"Text field '{data_config.text_field}' not found in dataset columns: {train_raw.column_names}"
@@ -123,12 +140,14 @@ def prepare_tinystories_assets(model_config: ModelConfig, data_config: DataConfi
         tokenizer,
         eos_token_id=eos_token_id,
         desc="tokenizing train split",
+        verbose=verbose,
     )
     val_tokens = _encode_texts(
         val_raw[data_config.text_field],
         tokenizer,
         eos_token_id=eos_token_id,
         desc="tokenizing val split",
+        verbose=verbose,
     )
     vocab_size = int(tokenizer.vocab_size)
     if tokenizer.eos_token_id is not None:
@@ -150,10 +169,18 @@ def build_tinystories_dataloaders(
     batch_size: int,
     num_workers: int = 0,
     seed: int = 0,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    verbose: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """Build TinyStories train/val dataloaders for causal LM."""
 
-    assets = prepare_tinystories_assets(model_config=model_config, data_config=data_config)
+    assets = prepare_tinystories_assets(
+        model_config=model_config,
+        data_config=data_config,
+        verbose=verbose,
+    )
     stride = data_config.block_stride if data_config.block_stride > 0 else model_config.block_size
 
     train_dataset = TokenBlockDataset(
@@ -167,11 +194,24 @@ def build_tinystories_dataloaders(
         stride=stride,
     )
 
-    train_generator = torch.Generator().manual_seed(seed + 2)
+    train_sampler = None
+    train_generator = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+    else:
+        train_generator = torch.Generator().manual_seed(seed + 2)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         generator=train_generator,
     )

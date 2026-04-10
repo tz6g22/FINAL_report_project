@@ -7,6 +7,7 @@ from typing import Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from .config import DataConfig, ModelConfig
 
@@ -83,6 +84,10 @@ def build_dataloaders(
     batch_size: int,
     num_workers: int = 0,
     seed: int = 0,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    verbose: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """Build deterministic train/validation dataloaders."""
 
@@ -95,6 +100,10 @@ def build_dataloaders(
             batch_size=batch_size,
             num_workers=num_workers,
             seed=seed,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+            verbose=verbose,
         )
 
     train_dataset = SyntheticSequenceDataset(
@@ -110,11 +119,24 @@ def build_dataloaders(
         seed=seed + 1,
     )
 
-    train_generator = torch.Generator().manual_seed(seed + 2)
+    train_sampler = None
+    train_generator = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+    else:
+        train_generator = torch.Generator().manual_seed(seed + 2)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         generator=train_generator,
     )

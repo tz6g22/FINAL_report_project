@@ -7,7 +7,6 @@ Clean, minimal decoder-only language-model project with two variants:
 
 ## Features
 
-- Small default model sizes for CPU/GPU smoke tests
 - Shared training/evaluation/checkpoint interfaces for both variants
 - Structured `ResidualHistory` with explicit `site_id` and `layer_id`
 - JSONL training logs plus matplotlib plotting
@@ -52,21 +51,16 @@ Plot a loss curve:
 python -m mini_gpt_attnres.visualize --logs mini_gpt_attnres_runs/attnres/metrics.jsonl --output mini_gpt_attnres_runs/attnres/loss.png
 ```
 
-Run a tiny baseline-vs-AttnRes comparison:
+Run formal TinyStories training (single process):
 
 ```bash
-python -m mini_gpt_attnres.demo_compare
-```
-
-Run a TinyStories smoke test (small subset, short training):
-
-```bash
-python -m mini_gpt_attnres.run_tinystories_smoke \
+python -m mini_gpt_attnres.run_tinystories \
   --run_mode both \
-  --train_texts 2000 \
-  --val_texts 200 \
-  --max_steps 20 \
-  --out_dir mini_gpt_attnres_runs/tinystories_smoke
+  --max_steps 20000 \
+  --batch_size 32 \
+  --block_size 256 \
+  --block_stride 256 \
+  --out_dir mini_gpt_attnres_runs/tinystories
 ```
 
 By default this now shows:
@@ -74,15 +68,17 @@ By default this now shows:
 - tqdm progress for non-training data loading/tokenization
 - Per-step training logs with model name + `loss/acc`
 
-Run only one variant (useful on limited GPUs):
+Run formal dual DDP training (2 GPUs per model, concurrent):
 
 ```bash
-python -m mini_gpt_attnres.run_tinystories_smoke \
-  --run_mode standard \
-  --train_texts 2000 \
-  --val_texts 200 \
-  --max_steps 20 \
-  --out_dir mini_gpt_attnres_runs/tinystories_smoke_standard
+python launch_dual_ddp.py \
+  --dataset_name roneneldan/TinyStories \
+  --tokenizer_name gpt2 \
+  --max_steps 20000 \
+  --batch_size 32 \
+  --block_size 256 \
+  --block_stride 256 \
+  --base_out_dir mini_gpt_attnres_runs/tinystories_dual
 ```
 
 ## AttnRes Design
