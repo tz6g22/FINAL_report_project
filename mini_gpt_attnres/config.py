@@ -68,6 +68,9 @@ class TrainConfig:
     device: str = "auto"
     num_workers: int = 0
     out_dir: str = "runs/default"
+    show_progress: bool = True
+    log_every_step: bool = True
+    log_sample_losses: bool = True
 
 
 @dataclass

@@ -58,6 +58,7 @@ def build_smoke_experiment(args: argparse.Namespace, out_dir: Path) -> Experimen
             device=args.device,
             num_workers=args.num_workers,
             out_dir=str(out_dir / "standard"),
+            log_sample_losses=not args.disable_sample_loss_log,
         ),
     )
 
@@ -83,6 +84,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--disable_sample_loss_log",
+        action="store_true",
+        help="Disable per-batch sample loss printouts.",
+    )
+    parser.add_argument(
+        "--run_mode",
+        type=str,
+        default="both",
+        choices=["both", "standard", "attnres"],
+        help="Choose which model(s) to train.",
+    )
     return parser.parse_args()
 
 
@@ -111,48 +124,48 @@ def main() -> None:
         "label_max_token_id": int(first_batch_labels.max().item()),
     }
 
-    standard_experiment = deepcopy(base_experiment)
-    standard_experiment.model.model_type = "standard"
-    standard_experiment.train.out_dir = str(root_dir / "standard")
-    standard_summary = train_model(standard_experiment)
+    if args.run_mode == "both":
+        models_to_run = ["standard", "attnres"]
+    else:
+        models_to_run = [args.run_mode]
 
-    attnres_experiment = deepcopy(base_experiment)
-    attnres_experiment.model.model_type = "attnres"
-    attnres_experiment.train.out_dir = str(root_dir / "attnres")
-    attnres_summary = train_model(attnres_experiment)
+    label_by_model = {"standard": "StandardGPT", "attnres": "AttnResGPT"}
+    train_summaries: dict[str, dict[str, object]] = {}
+    eval_metrics_by_model: dict[str, dict[str, float]] = {}
+    plots: dict[str, str] = {}
 
-    standard_eval = evaluate_checkpoint(
-        checkpoint_path=standard_summary["checkpoint_path"],
-        eval_batches=args.eval_batches,
-        device_name=args.device,
-    )
-    attnres_eval = evaluate_checkpoint(
-        checkpoint_path=attnres_summary["checkpoint_path"],
-        eval_batches=args.eval_batches,
-        device_name=args.device,
-    )
-    (root_dir / "standard_eval.json").write_text(json.dumps(standard_eval, indent=2), encoding="utf-8")
-    (root_dir / "attnres_eval.json").write_text(json.dumps(attnres_eval, indent=2), encoding="utf-8")
+    for model_type in models_to_run:
+        experiment = deepcopy(base_experiment)
+        experiment.model.model_type = model_type
+        experiment.train.out_dir = str(root_dir / model_type)
+        train_summary = train_model(experiment)
+        train_summaries[model_type] = train_summary
 
-    compare_plot = plot_logs(
-        log_paths=[standard_summary["log_path"], attnres_summary["log_path"]],
-        labels=["StandardGPT", "AttnResGPT"],
-        output_path=root_dir / "comparison_val_loss.png",
-        compare_split="val",
-        title="TinyStories Smoke Validation Loss",
-    )
-    standard_plot = plot_logs(
-        log_paths=[standard_summary["log_path"]],
-        labels=["StandardGPT"],
-        output_path=root_dir / "standard_loss.png",
-        title="TinyStories StandardGPT Loss",
-    )
-    attnres_plot = plot_logs(
-        log_paths=[attnres_summary["log_path"]],
-        labels=["AttnResGPT"],
-        output_path=root_dir / "attnres_loss.png",
-        title="TinyStories AttnResGPT Loss",
-    )
+        eval_metrics = evaluate_checkpoint(
+            checkpoint_path=train_summary["checkpoint_path"],
+            eval_batches=args.eval_batches,
+            device_name=args.device,
+        )
+        eval_metrics_by_model[model_type] = eval_metrics
+        (root_dir / f"{model_type}_eval.json").write_text(json.dumps(eval_metrics, indent=2), encoding="utf-8")
+
+        loss_plot = plot_logs(
+            log_paths=[train_summary["log_path"]],
+            labels=[label_by_model[model_type]],
+            output_path=root_dir / f"{model_type}_loss.png",
+            title=f"TinyStories {label_by_model[model_type]} Loss",
+        )
+        plots[f"{model_type}_loss"] = str(loss_plot)
+
+    if len(models_to_run) == 2:
+        compare_plot = plot_logs(
+            log_paths=[train_summaries["standard"]["log_path"], train_summaries["attnres"]["log_path"]],
+            labels=["StandardGPT", "AttnResGPT"],
+            output_path=root_dir / "comparison_val_loss.png",
+            compare_split="val",
+            title="TinyStories Smoke Validation Loss",
+        )
+        plots["comparison_val_loss"] = str(compare_plot)
 
     summary = {
         "dataset": {
@@ -161,19 +174,17 @@ def main() -> None:
             "train_texts": args.train_texts,
             "val_texts": args.val_texts,
         },
+        "run_mode": args.run_mode,
+        "models_ran": models_to_run,
         "dataloader_smoke": dataloader_smoke,
-        "standard": standard_summary,
-        "attnres": attnres_summary,
-        "reloaded_checkpoint_eval": {
-            "standard": standard_eval,
-            "attnres": attnres_eval,
-        },
-        "plots": {
-            "standard_loss": str(standard_plot),
-            "attnres_loss": str(attnres_plot),
-            "comparison_val_loss": str(compare_plot),
-        },
+        "reloaded_checkpoint_eval": eval_metrics_by_model,
+        "plots": plots,
     }
+    if "standard" in train_summaries:
+        summary["standard"] = train_summaries["standard"]
+    if "attnres" in train_summaries:
+        summary["attnres"] = train_summaries["attnres"]
+
     (root_dir / "tinystories_smoke_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
 

@@ -7,6 +7,10 @@ from typing import Iterable, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm may be unavailable in minimal environments
+    tqdm = None
 
 from .config import DataConfig, ModelConfig
 
@@ -48,19 +52,40 @@ class TinyStoriesAssets:
 def _load_hf_split(dataset_name: str, split: str):
     from datasets import load_dataset
 
+    print(f"[data] loading dataset={dataset_name} split={split}", flush=True)
     return load_dataset(dataset_name, split=split)
 
 
-def _encode_texts(texts: Iterable[str], tokenizer, eos_token_id: int) -> list[int]:
+def _encode_texts(texts: Iterable[str], tokenizer, eos_token_id: int, desc: str) -> list[int]:
     token_ids: list[int] = []
-    for text in texts:
+    total = len(texts) if hasattr(texts, "__len__") else None
+    iterator = texts
+    if tqdm is not None:
+        iterator = tqdm(texts, total=total, desc=desc, unit="text", dynamic_ncols=True)
+    elif total is not None:
+        print(f"[data] {desc}: 0/{total}", flush=True)
+
+    for idx, text in enumerate(iterator, start=1):
         if not text:
             continue
-        encoded = tokenizer.encode(text, add_special_tokens=False)
+        # TinyStories samples can exceed tokenizer.model_max_length (e.g., GPT-2's 1024).
+        # We later split the contiguous stream into smaller LM blocks, so suppress
+        # the tokenizer's long-sequence warning here.
+        try:
+            encoded = tokenizer.encode(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+                verbose=False,
+            )
+        except TypeError:
+            encoded = tokenizer.encode(text, add_special_tokens=False, truncation=False)
         if not encoded:
             continue
         token_ids.extend(encoded)
         token_ids.append(eos_token_id)
+        if tqdm is None and total is not None and (idx % 1000 == 0 or idx == total):
+            print(f"[data] {desc}: {idx}/{total}", flush=True)
     return token_ids
 
 
@@ -93,8 +118,18 @@ def prepare_tinystories_assets(model_config: ModelConfig, data_config: DataConfi
             f"Text field '{data_config.text_field}' not found in dataset columns: {val_raw.column_names}"
         )
 
-    train_tokens = _encode_texts(train_raw[data_config.text_field], tokenizer, eos_token_id=eos_token_id)
-    val_tokens = _encode_texts(val_raw[data_config.text_field], tokenizer, eos_token_id=eos_token_id)
+    train_tokens = _encode_texts(
+        train_raw[data_config.text_field],
+        tokenizer,
+        eos_token_id=eos_token_id,
+        desc="tokenizing train split",
+    )
+    val_tokens = _encode_texts(
+        val_raw[data_config.text_field],
+        tokenizer,
+        eos_token_id=eos_token_id,
+        desc="tokenizing val split",
+    )
     vocab_size = int(tokenizer.vocab_size)
     if tokenizer.eos_token_id is not None:
         vocab_size = max(vocab_size, int(tokenizer.eos_token_id) + 1)

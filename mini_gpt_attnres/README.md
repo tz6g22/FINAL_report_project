@@ -62,10 +62,34 @@ Run a TinyStories smoke test (small subset, short training):
 
 ```bash
 python -m mini_gpt_attnres.run_tinystories_smoke \
+  --run_mode both \
   --train_texts 2000 \
   --val_texts 200 \
   --max_steps 20 \
   --out_dir mini_gpt_attnres_runs/tinystories_smoke
+```
+
+By default this now shows:
+
+- tqdm progress for non-training data loading/tokenization
+- Per-step training logs with `loss/acc`
+- Current batch `sample_losses=[...]` for each training step
+
+If training logs are too verbose, add:
+
+```bash
+--disable_sample_loss_log
+```
+
+Run only one variant (useful on limited GPUs):
+
+```bash
+python -m mini_gpt_attnres.run_tinystories_smoke \
+  --run_mode standard \
+  --train_texts 2000 \
+  --val_texts 200 \
+  --max_steps 20 \
+  --out_dir mini_gpt_attnres_runs/tinystories_smoke_standard
 ```
 
 ## AttnRes Design
