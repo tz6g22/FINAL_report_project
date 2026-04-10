@@ -257,7 +257,7 @@ def prepare_tinystories_assets(
                 _save_cached_assets(role_path, assets=cached, data_config=data_config, verbose=verbose)
             return cached
 
-        should_build = allow_cache_build and model_type != "attnres"
+        should_build = allow_cache_build
         if not should_build:
             cached_wait = _wait_for_cache_paths(
                 candidate_paths=[

@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import List, Sequence
 
@@ -79,6 +80,49 @@ def _stream_prefixed_output(prefix: str, stream) -> None:
     stream.close()
 
 
+def _prepare_tinystories_token_cache_once(args: argparse.Namespace) -> None:
+    if args.dataset_type != "tinystories":
+        return
+
+    from .config import default_experiment
+    from .data_tinystories import prepare_tinystories_assets
+
+    experiment = default_experiment(model_type="standard")
+    experiment.data.dataset_type = args.dataset_type
+    if args.dataset_name is not None:
+        experiment.data.hf_dataset_name = args.dataset_name
+    if args.tokenizer_name is not None:
+        experiment.data.tokenizer_name = args.tokenizer_name
+    if args.train_texts is not None:
+        experiment.data.train_texts = args.train_texts
+    if args.val_texts is not None:
+        experiment.data.val_texts = args.val_texts
+    if args.block_stride is not None:
+        experiment.data.block_stride = args.block_stride
+    if args.block_size is not None:
+        experiment.model.block_size = args.block_size
+
+    print("[launcher] preparing TinyStories token cache (single tokenization pass)...", flush=True)
+    standard_model_config = deepcopy(experiment.model)
+    standard_model_config.model_type = "standard"
+    prepare_tinystories_assets(
+        model_config=standard_model_config,
+        data_config=experiment.data,
+        verbose=True,
+        allow_cache_build=True,
+    )
+
+    attnres_model_config = deepcopy(standard_model_config)
+    attnres_model_config.model_type = "attnres"
+    prepare_tinystories_assets(
+        model_config=attnres_model_config,
+        data_config=experiment.data,
+        verbose=True,
+        allow_cache_build=False,
+    )
+    print("[launcher] token cache ready for both standard and attnres.", flush=True)
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description="Launch concurrent 2x2-GPU DDP training (standard + attnres).")
     parser.add_argument("--dataset_type", type=str, default="tinystories")
@@ -139,6 +183,8 @@ def main() -> None:
     print("[launcher] attnres cmd:", shlex.join(attnres_cmd), flush=True)
     if args.dry_run:
         return
+
+    _prepare_tinystories_token_cache_once(args)
 
     env_standard = os.environ.copy()
     env_attnres = os.environ.copy()
