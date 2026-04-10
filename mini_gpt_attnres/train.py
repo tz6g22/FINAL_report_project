@@ -81,9 +81,23 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def append_jsonl(path: Path, payload: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
+    path = Path(path)
+    payload_line = json.dumps(payload) + "\n"
+
+    # Some distributed filesystems can transiently report ENOENT after mkdir.
+    # Retry once after recreating the parent to avoid rank-0 log-write crashes.
+    last_error: FileNotFoundError | None = None
+    for _ in range(2):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(payload_line)
+            return
+        except FileNotFoundError as error:
+            last_error = error
+            time.sleep(0.05)
+
+    raise FileNotFoundError(f"Failed to append JSONL to '{path}' after ensuring parent directory.") from last_error
 
 
 def batch_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -335,6 +349,7 @@ def train_model(
                 "local_rank": dist_ctx.local_rank,
                 "current_device": current_device,
             }
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
             with summary_path.open("w", encoding="utf-8") as handle:
                 json.dump(summary, handle, indent=2)
             val_loss = summary["final_val_loss"]
