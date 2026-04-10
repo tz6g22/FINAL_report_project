@@ -9,5 +9,8 @@ __pycache__
 *.json
 *.jsonl
 *.png
+<<<<<<< HEAD
 example/
 mini_gpt_attnres_runs/
+=======
+
