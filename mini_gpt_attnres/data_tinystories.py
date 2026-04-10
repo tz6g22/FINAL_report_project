@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -60,7 +61,7 @@ class TinyStoriesAssets:
     vocab_size: int
 
 
-def _resolve_token_cache_path(data_config: DataConfig) -> Path:
+def _resolve_token_cache_paths(data_config: DataConfig) -> dict[str, Path]:
     base_dir = Path(data_config.token_cache_dir).expanduser()
     if not base_dir.is_absolute():
         project_root = Path(__file__).resolve().parents[1]
@@ -73,7 +74,12 @@ def _resolve_token_cache_path(data_config: DataConfig) -> Path:
         "val_texts": data_config.val_texts,
     }
     signature = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
-    return base_dir / f"token_cache_{signature}.pt"
+    shared = base_dir / f"token_cache_{signature}.pt"
+    return {
+        "shared": shared,
+        "standard": base_dir / f"token_cache_{signature}_standard.pt",
+        "attnres": base_dir / f"token_cache_{signature}_attnres.pt",
+    }
 
 
 def _load_cached_assets(path: Path, data_config: DataConfig, verbose: bool = True) -> TinyStoriesAssets | None:
@@ -139,30 +145,45 @@ def _save_cached_assets(path: Path, assets: TinyStoriesAssets, data_config: Data
         print(f"[data] saved token cache: {path}", flush=True)
 
 
-def _acquire_cache_lock(cache_path: Path, verbose: bool = True) -> tuple[int | None, Path]:
-    lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.write(fd, str(os.getpid()).encode("utf-8"))
-            return fd, lock_path
-        except FileExistsError:
-            if verbose:
-                print(f"[data] waiting for token cache lock: {lock_path}", flush=True)
-            time.sleep(0.5)
-
-
-def _release_cache_lock(fd: int | None, lock_path: Path) -> None:
-    if fd is None:
+def _replicate_cache_file(source_path: Path, target_path: Path, verbose: bool = True) -> None:
+    if source_path == target_path:
         return
-    try:
-        os.close(fd)
-    finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp.copy.{os.getpid()}.{uuid.uuid4().hex}")
+    shutil.copyfile(source_path, tmp_path)
+    os.replace(tmp_path, target_path)
+    if verbose:
+        print(f"[data] replicated token cache: {target_path}", flush=True)
+
+
+def _wait_for_cache_paths(
+    candidate_paths: list[Path],
+    data_config: DataConfig,
+    verbose: bool = True,
+    timeout_seconds: float = 7200.0,
+    poll_interval_seconds: float = 0.5,
+) -> TinyStoriesAssets:
+    dedup_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidate_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        dedup_paths.append(path)
+
+    start = time.monotonic()
+    while True:
+        for path in dedup_paths:
+            cached = _load_cached_assets(path, data_config=data_config, verbose=verbose)
+            if cached is not None:
+                return cached
+        if verbose:
+            for path in dedup_paths:
+                print(f"[data] waiting for token cache file: {path}", flush=True)
+        if time.monotonic() - start > timeout_seconds:
+            joined = ", ".join(str(path) for path in dedup_paths)
+            raise TimeoutError(f"Timed out waiting for token cache files: {joined}")
+        time.sleep(poll_interval_seconds)
 
 
 def _load_hf_split(dataset_name: str, split: str, verbose: bool = True):
@@ -216,34 +237,56 @@ def prepare_tinystories_assets(
     model_config: ModelConfig,
     data_config: DataConfig,
     verbose: bool = True,
+    allow_cache_build: bool = True,
 ) -> TinyStoriesAssets:
     """Load TinyStories and tokenize into train/val token streams."""
 
-    cache_path = _resolve_token_cache_path(data_config)
+    cache_paths = _resolve_token_cache_paths(data_config)
+    model_type = str(getattr(model_config, "model_type", "")).lower()
+    role_path = cache_paths.get(model_type, cache_paths["shared"])
+    local_candidate_paths = [role_path, cache_paths["shared"]]
+
     if data_config.use_token_cache:
-        cached = _load_cached_assets(cache_path, data_config=data_config, verbose=verbose)
-        if cached is not None:
+        for path in local_candidate_paths:
+            cached = _load_cached_assets(path, data_config=data_config, verbose=verbose)
+            if cached is None:
+                continue
             if model_config.vocab_size != cached.vocab_size:
                 model_config.vocab_size = cached.vocab_size
+            if path != role_path:
+                _save_cached_assets(role_path, assets=cached, data_config=data_config, verbose=verbose)
             return cached
-        lock_fd, lock_path = _acquire_cache_lock(cache_path, verbose=verbose)
-        try:
-            cached_after_lock = _load_cached_assets(cache_path, data_config=data_config, verbose=verbose)
-            if cached_after_lock is not None:
-                if model_config.vocab_size != cached_after_lock.vocab_size:
-                    model_config.vocab_size = cached_after_lock.vocab_size
-                return cached_after_lock
-            if verbose:
-                print("[data] token cache miss; building tokenized TinyStories assets...", flush=True)
-            assets = _prepare_tinystories_assets_uncached(
-                model_config=model_config,
+
+        should_build = allow_cache_build and model_type != "attnres"
+        if not should_build:
+            cached_wait = _wait_for_cache_paths(
+                candidate_paths=[
+                    role_path,
+                    cache_paths["shared"],
+                    cache_paths["standard"],
+                    cache_paths["attnres"],
+                ],
                 data_config=data_config,
                 verbose=verbose,
             )
-            _save_cached_assets(cache_path, assets=assets, data_config=data_config, verbose=verbose)
-            return assets
-        finally:
-            _release_cache_lock(lock_fd, lock_path)
+            if model_config.vocab_size != cached_wait.vocab_size:
+                model_config.vocab_size = cached_wait.vocab_size
+            if role_path != cache_paths["shared"] and not role_path.exists():
+                # Ensure this role gets its own cache replica once a shared/source cache appears.
+                _save_cached_assets(role_path, assets=cached_wait, data_config=data_config, verbose=verbose)
+            return cached_wait
+
+        if verbose:
+            print("[data] token cache miss; building tokenized TinyStories assets...", flush=True)
+        assets = _prepare_tinystories_assets_uncached(
+            model_config=model_config,
+            data_config=data_config,
+            verbose=verbose,
+        )
+        _save_cached_assets(cache_paths["shared"], assets=assets, data_config=data_config, verbose=verbose)
+        _replicate_cache_file(cache_paths["shared"], cache_paths["standard"], verbose=verbose)
+        _replicate_cache_file(cache_paths["shared"], cache_paths["attnres"], verbose=verbose)
+        return assets
 
     return _prepare_tinystories_assets_uncached(
         model_config=model_config,
@@ -334,6 +377,7 @@ def build_tinystories_dataloaders(
         model_config=model_config,
         data_config=data_config,
         verbose=verbose,
+        allow_cache_build=(not distributed) or (rank == 0),
     )
     stride = data_config.block_stride if data_config.block_stride > 0 else model_config.block_size
 
