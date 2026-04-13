@@ -12,7 +12,7 @@ from .attnres import ActivationOverrideMap
 from .blocks import AttnResGPTBlock, StandardGPTBlock
 from .config import ModelConfig
 from .history import ResidualHistory
-from .interp.cache import ActivationCache
+from interp.cache import ActivationCache
 
 
 class GPTBase(nn.Module):

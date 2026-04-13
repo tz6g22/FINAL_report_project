@@ -1,26 +1,3 @@
-"""Interpretability utilities for the mini GPT AttnRes project."""
+"""Compatibility shim for top-level `interp` package."""
 
-from .ablation import mean_ablation_override, zero_ablation_override, zero_attention_head_override
-from .analysis_adapter import AnalysisAdapter, AttnResSiteTrace, ModelTrace, TraceRecord
-from .cache import ActivationCache
-from .hooks import HookCollection, register_output_hooks
-from .memorization_runner import MemorizationPatchingRunner, PatchingRunResult, SiteSweepResult
-from .patching import patch_attention_head_override, patch_from_cache
-
-__all__ = [
-    "ActivationCache",
-    "AnalysisAdapter",
-    "AttnResSiteTrace",
-    "HookCollection",
-    "MemorizationPatchingRunner",
-    "ModelTrace",
-    "PatchingRunResult",
-    "SiteSweepResult",
-    "TraceRecord",
-    "mean_ablation_override",
-    "patch_attention_head_override",
-    "patch_from_cache",
-    "register_output_hooks",
-    "zero_ablation_override",
-    "zero_attention_head_override",
-]
+from interp import *  # noqa: F401,F403

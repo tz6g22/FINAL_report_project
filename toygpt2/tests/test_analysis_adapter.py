@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from toygpt2.config import ModelConfig
-from toygpt2.interp.analysis_adapter import AnalysisAdapter
+from interp.analysis_adapter import AnalysisAdapter
 from toygpt2.model import build_model
 
 

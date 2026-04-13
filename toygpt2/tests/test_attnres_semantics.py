@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from toygpt2.config import ModelConfig
-from toygpt2.interp.cache import ActivationCache
+from interp.cache import ActivationCache
 from toygpt2.model import build_model
 
 
