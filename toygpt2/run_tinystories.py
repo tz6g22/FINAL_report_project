@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Formal TinyStories training for StandardGPT and AttnResGPT.")
     parser.add_argument("--dataset_name", type=str, default="roneneldan/TinyStories")
     parser.add_argument("--tokenizer_name", type=str, default="gpt2")
-    parser.add_argument("--out_dir", type=str, default="mini_gpt_attnres_runs/tinystories")
+    parser.add_argument("--out_dir", type=str, default="toygpt2_runs/tinystories")
     parser.add_argument("--train_texts", type=int, default=None, help="Optional cap; default uses full train split.")
     parser.add_argument("--val_texts", type=int, default=None, help="Optional cap; default uses full validation split.")
     parser.add_argument("--block_size", type=int, default=256)

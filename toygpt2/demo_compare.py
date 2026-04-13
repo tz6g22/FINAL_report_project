@@ -27,7 +27,7 @@ def evaluate_checkpoint(checkpoint_path: str, device_name: str, eval_batches: in
 
 
 def main() -> None:
-    root_dir = Path("mini_gpt_attnres_runs/demo_compare")
+    root_dir = Path("toygpt2_runs/demo_compare")
     experiment = ExperimentConfig(
         model=ModelConfig(
             vocab_size=48,

@@ -12,7 +12,7 @@ __pycache__
 *.md
 
 example/
-mini_gpt_attnres_runs/
+toygpt2_runs/
 
 .pytest_cache
 readme.md

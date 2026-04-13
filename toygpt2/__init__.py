@@ -1,4 +1,4 @@
-"""Mini GPT project with a standard baseline and an AttnRes variant."""
+"""ToyGPT2 project with a standard baseline and an AttnRes variant."""
 
 from .config import DataConfig, ExperimentConfig, ModelConfig, TrainConfig, default_experiment
 from .model import AttnResGPT, StandardGPT, build_model

@@ -1,7 +1,7 @@
 """Assertion-based sanity tests for AttnRes block semantics.
 
 This file is pytest-compatible, but it can also be run directly with:
-    python mini_gpt_attnres/tests/test_attnres_semantics.py
+    python toygpt2/tests/test_attnres_semantics.py
 """
 
 from __future__ import annotations
@@ -16,9 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from mini_gpt_attnres.config import ModelConfig
-from mini_gpt_attnres.interp.cache import ActivationCache
-from mini_gpt_attnres.model import build_model
+from toygpt2.config import ModelConfig
+from toygpt2.interp.cache import ActivationCache
+from toygpt2.model import build_model
 
 
 def _make_config(model_type: str, n_layer: int) -> ModelConfig:

@@ -1,4 +1,4 @@
-"""Configuration helpers for the mini GPT AttnRes project."""
+"""Configuration helpers for the toygpt2 project."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ class DataConfig:
     val_texts: int | None = None
     block_stride: int = 256
     use_token_cache: bool = True
-    token_cache_dir: str = "mini_gpt_attnres_cache/tinystories"
+    token_cache_dir: str = "toygpt2_cache/tinystories"
 
     def __post_init__(self) -> None:
         valid = {"random", "repeated_pattern", "retrieval", "tinystories"}
@@ -119,5 +119,5 @@ def default_experiment(model_type: str = "standard") -> ExperimentConfig:
 
     experiment = ExperimentConfig()
     experiment.model.model_type = model_type
-    experiment.train.out_dir = f"mini_gpt_attnres_runs/{model_type}"
+    experiment.train.out_dir = f"toygpt2_runs/{model_type}"
     return experiment

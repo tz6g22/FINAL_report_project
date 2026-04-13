@@ -38,7 +38,7 @@ def _build_train_command(
         "--master_port",
         str(master_port),
         "-m",
-        "mini_gpt_attnres.train",
+        "toygpt2.train",
         "--model_type",
         model_type,
         "--out_dir",
@@ -144,7 +144,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", type=str, default="cuda", help="Passed to train.py.")
-    parser.add_argument("--base_out_dir", type=str, default="mini_gpt_attnres_runs/tinystories_dual")
+    parser.add_argument("--base_out_dir", type=str, default="toygpt2_runs/tinystories_dual")
     parser.add_argument("--nproc_per_model", type=int, default=2)
     parser.add_argument("--standard_gpus", type=str, default="0,1")
     parser.add_argument("--attnres_gpus", type=str, default="2,3")

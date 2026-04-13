@@ -1,7 +1,7 @@
 """Unit tests for unified analysis adapter.
 
 This file is pytest-compatible and can also run directly:
-    python mini_gpt_attnres/tests/test_analysis_adapter.py
+    python toygpt2/tests/test_analysis_adapter.py
 """
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from mini_gpt_attnres.config import ModelConfig
-from mini_gpt_attnres.interp.analysis_adapter import AnalysisAdapter
-from mini_gpt_attnres.model import build_model
+from toygpt2.config import ModelConfig
+from toygpt2.interp.analysis_adapter import AnalysisAdapter
+from toygpt2.model import build_model
 
 
 def _make_tokens(vocab_size: int, block_size: int) -> torch.Tensor:
