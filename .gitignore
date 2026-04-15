@@ -13,7 +13,9 @@ __pycache__
 
 example/
 toygpt2_runs/
+toygpt2_cache
 .pytest_cache
 readme.md
 .idea/
 .claude
+
