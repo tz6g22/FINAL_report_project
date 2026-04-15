@@ -1,4 +1,0 @@
-torch>=2.1
-matplotlib>=3.7
-datasets>=2.19
-transformers>=4.40
