@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from stream_analysis.path_utils import resolve_project_path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parents[1]
@@ -31,15 +32,23 @@ from .utils import (
     ensure_dir,
     finite_stats,
     format_top_pairs,
+    maybe_tqdm,
     maybe_make_dataframe,
     read_json,
     resolve_device,
     safe_float,
+    stage_progress,
     write_csv_rows,
     write_json,
 )
 
 logger = logging.getLogger("sae.eval")
+
+
+def _unwrap_sae_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying SAE module when wrapped by DDP/accelerate."""
+
+    return getattr(model, "module", model)
 
 
 def load_sae_checkpoint(
@@ -49,10 +58,7 @@ def load_sae_checkpoint(
 ) -> tuple[TopKSAE, SAEConfig, Dict[str, Any]]:
     """Load a serialized SAE checkpoint."""
 
-    resolved = Path(checkpoint_path).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"SAE checkpoint not found: {resolved}")
-
+    resolved = resolve_project_path(checkpoint_path)
     payload = torch.load(resolved, map_location=device, weights_only=False)
     if not isinstance(payload, Mapping):
         raise TypeError(f"SAE checkpoint must be a mapping, got {type(payload).__name__}.")
@@ -127,24 +133,69 @@ class _ReconstructionAccumulator:
         self.total_input_sq_sum += float(inputs.pow(2).sum().item())
         self.fire_count += (outputs["z"].detach().cpu().abs() > dead_threshold).sum(dim=0)
 
-    def summary(self) -> Dict[str, float]:
-        if self.total_samples <= 0 or self.total_elements <= 0:
+    def summary(
+        self,
+        *,
+        accelerator: Any | None = None,
+        device: torch.device | None = None,
+    ) -> Dict[str, float]:
+        total_samples = float(self.total_samples)
+        total_elements = float(self.total_elements)
+        total_sq_error = float(self.total_sq_error)
+        total_loss = float(self.total_loss)
+        total_aux = float(self.total_aux)
+        total_l0 = float(self.total_l0)
+        total_input_sum = float(self.total_input_sum)
+        total_input_sq_sum = float(self.total_input_sq_sum)
+        fire_count = self.fire_count
+
+        if accelerator is not None and int(getattr(accelerator, "num_processes", 1)) > 1:
+            reduce_device = accelerator.device if device is None else device
+            totals = torch.tensor(
+                [
+                    total_samples,
+                    total_elements,
+                    total_sq_error,
+                    total_loss,
+                    total_aux,
+                    total_l0,
+                    total_input_sum,
+                    total_input_sq_sum,
+                ],
+                device=reduce_device,
+                dtype=torch.float64,
+            )
+            totals = accelerator.reduce(totals, reduction="sum")
+            total_samples = float(totals[0].item())
+            total_elements = float(totals[1].item())
+            total_sq_error = float(totals[2].item())
+            total_loss = float(totals[3].item())
+            total_aux = float(totals[4].item())
+            total_l0 = float(totals[5].item())
+            total_input_sum = float(totals[6].item())
+            total_input_sq_sum = float(totals[7].item())
+            fire_count = accelerator.reduce(
+                fire_count.to(device=reduce_device, dtype=torch.float64),
+                reduction="sum",
+            ).to(dtype=torch.long).cpu()
+
+        if total_samples <= 0 or total_elements <= 0:
             raise RuntimeError("No batches were accumulated.")
 
-        recon_mse = self.total_sq_error / self.total_elements
-        mean_input = self.total_input_sum / self.total_elements
-        mean_input_sq = self.total_input_sq_sum / self.total_elements
+        recon_mse = total_sq_error / total_elements
+        mean_input = total_input_sum / total_elements
+        mean_input_sq = total_input_sq_sum / total_elements
         input_variance = max(0.0, mean_input_sq - mean_input**2)
-        dead_mask = self.fire_count == 0
+        dead_mask = fire_count == 0
         return {
-            "num_samples": float(self.total_samples),
-            "num_elements": float(self.total_elements),
+            "num_samples": float(total_samples),
+            "num_elements": float(total_elements),
             "recon_mse": float(recon_mse),
             "normalized_recon_mse": float(recon_mse / input_variance) if input_variance > 0.0 else float("nan"),
             "input_variance": float(input_variance),
-            "loss": float(self.total_loss / self.total_samples),
-            "auxk_loss": float(self.total_aux / self.total_samples),
-            "avg_l0": float(self.total_l0 / self.total_samples),
+            "loss": float(total_loss / total_samples),
+            "auxk_loss": float(total_aux / total_samples),
+            "avg_l0": float(total_l0 / total_samples),
             "dead_latent_count": float(dead_mask.sum().item()),
             "alive_latent_count": float((~dead_mask).sum().item()),
             "dead_latent_frac": float(dead_mask.float().mean().item()),
@@ -160,16 +211,30 @@ def evaluate_reconstruction(
     auxk_alpha: float,
     dead_threshold: float,
     max_batches: int | None = None,
+    accelerator: Any | None = None,
+    progress_desc: str | None = None,
+    show_progress: bool = False,
 ) -> Dict[str, float]:
     """Evaluate reconstruction quality on a held-out loader."""
 
+    raw_model = _unwrap_sae_model(model)
     model.eval()
-    accumulator = _ReconstructionAccumulator(model.n_latents)
+    accumulator = _ReconstructionAccumulator(int(getattr(raw_model, "n_latents")))
+    total_batches = len(dataloader)
+    if max_batches is not None:
+        total_batches = min(total_batches, max_batches)
+    batch_iterator = maybe_tqdm(
+        enumerate(dataloader),
+        desc=progress_desc or "sae-eval-recon",
+        total=total_batches,
+        enabled=show_progress,
+        leave=False,
+    )
     with torch.no_grad():
-        for batch_index, batch in enumerate(dataloader):
+        for batch_index, batch in batch_iterator:
             if max_batches is not None and batch_index >= max_batches:
                 break
-            inputs = _coerce_batch(batch, device=device, dtype=model.b_pre.dtype)
+            inputs = _coerce_batch(batch, device=device, dtype=raw_model.b_pre.dtype)
             outputs = model(inputs)
             accumulator.update(
                 inputs,
@@ -178,7 +243,7 @@ def evaluate_reconstruction(
                 auxk_alpha=auxk_alpha,
                 dead_threshold=dead_threshold,
             )
-    return accumulator.summary()
+    return accumulator.summary(accelerator=accelerator, device=device)
 
 
 def evaluate_sae_on_loader(
@@ -190,6 +255,9 @@ def evaluate_sae_on_loader(
     auxk_alpha: float,
     dead_threshold: float,
     max_batches: int | None = None,
+    accelerator: Any | None = None,
+    progress_desc: str | None = None,
+    show_progress: bool = False,
 ) -> Dict[str, float]:
     """Backward-compatible alias for the phase-1 evaluation entrypoint."""
 
@@ -201,6 +269,9 @@ def evaluate_sae_on_loader(
         auxk_alpha=auxk_alpha,
         dead_threshold=dead_threshold,
         max_batches=max_batches,
+        accelerator=accelerator,
+        progress_desc=progress_desc,
+        show_progress=show_progress,
     )
 
 
@@ -275,6 +346,8 @@ def compute_decoder_overlap(
     heatmap_max_latents: int = 256,
     max_exact_values: int = 2_000_000,
     max_sample_values: int = 200_000,
+    progress_desc: str | None = None,
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Compute cosine overlap statistics between decoder atoms.
 
@@ -282,7 +355,8 @@ def compute_decoder_overlap(
     ``[n_latents, d_in]``. The overlap summary therefore compares decoder rows.
     """
 
-    decoder = F.normalize(model.W_dec.detach().cpu().to(dtype=torch.float32), dim=1, eps=1e-8)
+    raw_model = _unwrap_sae_model(model)
+    decoder = F.normalize(raw_model.W_dec.detach().cpu().to(dtype=torch.float32), dim=1, eps=1e-8)
     n_latents = int(decoder.shape[0])
     rng = np.random.default_rng(0)
     pair_count = n_latents * (n_latents - 1) // 2
@@ -297,7 +371,15 @@ def compute_decoder_overlap(
     if n_latents <= heatmap_max_latents:
         heatmap = (decoder @ decoder.T).numpy()
 
-    for row_start in range(0, n_latents, chunk_size):
+    row_starts = range(0, n_latents, chunk_size)
+    row_iterator = maybe_tqdm(
+        row_starts,
+        desc=progress_desc or "sae-eval-overlap",
+        total=len(row_starts),
+        enabled=show_progress,
+        leave=False,
+    )
+    for row_start in row_iterator:
         row_end = min(row_start + chunk_size, n_latents)
         left = decoder[row_start:row_end]
         for col_start in range(row_start, n_latents, chunk_size):
@@ -440,17 +522,30 @@ def compute_coactivation(
     topk_pairs: int = 20,
     heatmap_max_latents: int = 256,
     full_matrix_latent_limit: int = 1024,
+    progress_desc: str | None = None,
+    show_progress: bool = False,
 ) -> Dict[str, object]:
     """Compute coactivation statistics on a held-out loader."""
 
+    raw_model = _unwrap_sae_model(model)
     model.eval()
-    if model.n_latents <= full_matrix_latent_limit:
+    total_batches = len(dataloader)
+    if max_batches is not None:
+        total_batches = min(total_batches, max_batches)
+    if int(getattr(raw_model, "n_latents")) <= full_matrix_latent_limit:
         latent_batches = []
+        batch_iterator = maybe_tqdm(
+            enumerate(dataloader),
+            desc=progress_desc or "sae-eval-coact",
+            total=total_batches,
+            enabled=show_progress,
+            leave=False,
+        )
         with torch.no_grad():
-            for batch_index, batch in enumerate(dataloader):
+            for batch_index, batch in batch_iterator:
                 if max_batches is not None and batch_index >= max_batches:
                     break
-                inputs = _coerce_batch(batch, device=device, dtype=model.b_pre.dtype)
+                inputs = _coerce_batch(batch, device=device, dtype=raw_model.b_pre.dtype)
                 latent_batches.append(model(inputs)["z"].detach().cpu())
         if not latent_batches:
             raise RuntimeError("Evaluation loader produced zero batches.")
@@ -462,23 +557,37 @@ def compute_coactivation(
             heatmap_max_latents=heatmap_max_latents,
         )
 
-    activation_counts = torch.zeros(model.n_latents, dtype=torch.long)
+    activation_counts = torch.zeros(int(getattr(raw_model, "n_latents")), dtype=torch.long)
+    count_iterator = maybe_tqdm(
+        enumerate(dataloader),
+        desc=f"{progress_desc or 'sae-eval-coact'} count",
+        total=total_batches,
+        enabled=show_progress,
+        leave=False,
+    )
     with torch.no_grad():
-        for batch_index, batch in enumerate(dataloader):
+        for batch_index, batch in count_iterator:
             if max_batches is not None and batch_index >= max_batches:
                 break
-            inputs = _coerce_batch(batch, device=device, dtype=model.b_pre.dtype)
+            inputs = _coerce_batch(batch, device=device, dtype=raw_model.b_pre.dtype)
             outputs = model(inputs)
             activation_counts += (outputs["z"].detach().cpu().abs() > threshold).sum(dim=0)
 
-    sample_latents = min(full_matrix_latent_limit, model.n_latents)
+    sample_latents = min(full_matrix_latent_limit, int(getattr(raw_model, "n_latents")))
     subset = torch.topk(activation_counts, k=sample_latents).indices
     subset_batches = []
+    subset_iterator = maybe_tqdm(
+        enumerate(dataloader),
+        desc=f"{progress_desc or 'sae-eval-coact'} subset",
+        total=total_batches,
+        enabled=show_progress,
+        leave=False,
+    )
     with torch.no_grad():
-        for batch_index, batch in enumerate(dataloader):
+        for batch_index, batch in subset_iterator:
             if max_batches is not None and batch_index >= max_batches:
                 break
-            inputs = _coerce_batch(batch, device=device, dtype=model.b_pre.dtype)
+            inputs = _coerce_batch(batch, device=device, dtype=raw_model.b_pre.dtype)
             outputs = model(inputs)
             subset_batches.append(outputs["z"].detach().cpu()[:, subset])
     if not subset_batches:
@@ -553,6 +662,9 @@ class SAEEvaluator:
         *,
         dead_threshold: float = 1e-8,
         max_batches: int | None = None,
+        accelerator: Any | None = None,
+        progress_desc: str | None = None,
+        show_progress: bool = False,
     ) -> Dict[str, float]:
         return evaluate_reconstruction(
             self.model,
@@ -562,6 +674,9 @@ class SAEEvaluator:
             auxk_alpha=self.sae_config.auxk_alpha,
             dead_threshold=dead_threshold,
             max_batches=max_batches,
+            accelerator=accelerator,
+            progress_desc=progress_desc,
+            show_progress=show_progress,
         )
 
     def evaluate_activation_dir(
@@ -573,8 +688,11 @@ class SAEEvaluator:
         num_workers: int = 0,
         max_batches: int | None = None,
         dead_threshold: float = 1e-8,
+        accelerator: Any | None = None,
+        show_progress: bool = False,
     ) -> Dict[str, float]:
-        dataset = ActivationShardDataset(activation_dir, preprocessing=preprocessing)
+        with stage_progress("load activation shards", enabled=show_progress):
+            dataset = ActivationShardDataset(activation_dir, preprocessing=preprocessing)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -586,6 +704,9 @@ class SAEEvaluator:
             dataloader,
             dead_threshold=dead_threshold,
             max_batches=max_batches,
+            accelerator=accelerator,
+            progress_desc="sae-eval-recon",
+            show_progress=show_progress,
         )
         metrics.update(
             {
@@ -606,8 +727,11 @@ class SAEEvaluator:
         max_batches: int | None = None,
         dead_threshold: float = 1e-8,
         topk_pairs: int = 20,
+        accelerator: Any | None = None,
+        show_progress: bool = False,
     ) -> Dict[str, object]:
-        dataset = ActivationShardDataset(activation_dir, preprocessing=preprocessing)
+        with stage_progress("load activation shards", enabled=show_progress):
+            dataset = ActivationShardDataset(activation_dir, preprocessing=preprocessing)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -619,8 +743,16 @@ class SAEEvaluator:
             dataloader,
             dead_threshold=dead_threshold,
             max_batches=max_batches,
+            accelerator=accelerator,
+            progress_desc="sae-eval-recon",
+            show_progress=show_progress,
         )
-        decoder_overlap = compute_decoder_overlap(self.model, topk_pairs=topk_pairs)
+        decoder_overlap = compute_decoder_overlap(
+            self.model,
+            topk_pairs=topk_pairs,
+            progress_desc="sae-eval-overlap",
+            show_progress=show_progress,
+        )
         coactivation = compute_coactivation(
             self.model,
             dataloader,
@@ -628,7 +760,10 @@ class SAEEvaluator:
             threshold=dead_threshold,
             max_batches=max_batches,
             topk_pairs=topk_pairs,
+            progress_desc="sae-eval-coact",
+            show_progress=show_progress,
         )
+        raw_model = _unwrap_sae_model(self.model)
         combined = summarize_sae_eval(
             reconstruction,
             decoder_overlap,
@@ -637,8 +772,8 @@ class SAEEvaluator:
                 "activation_dir": str(Path(activation_dir).expanduser().resolve()),
                 "preprocessing": preprocessing,
                 "d_in": dataset.d_in,
-                "n_latents": self.model.n_latents,
-                "k": self.model.config.k,
+                "n_latents": int(getattr(raw_model, "n_latents")),
+                "k": int(getattr(raw_model.config, "k")),
             },
         )
         return {
@@ -670,7 +805,8 @@ def save_sae_eval_outputs(
     """Persist a full SAE evaluation payload."""
 
     output_dir = ensure_dir(out_dir)
-    summary_path = write_json(dict(summary_payload), output_dir / summary_filename)
+    summary_json_payload = {key: value for key, value in summary_payload.items() if key != "dataframe"}
+    summary_path = write_json(summary_json_payload, output_dir / summary_filename)
     metrics_rows = summary_payload.get("metrics_rows", [])
     metrics_path = output_dir / metrics_filename
     if isinstance(metrics_rows, Sequence):
@@ -705,7 +841,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         device = resolve_device(args.device)
-        model, sae_config, payload = load_sae_checkpoint(args.sae_checkpoint, device=device)
+        with stage_progress("load SAE checkpoint", enabled=True):
+            model, sae_config, payload = load_sae_checkpoint(args.sae_checkpoint, device=device)
 
         inherited_preprocessing = None
         train_cfg_payload = payload.get("train_config")
@@ -736,6 +873,7 @@ def main(argv: list[str] | None = None) -> int:
             preprocessing=preprocessing,
             num_workers=eval_config.num_workers,
             max_batches=eval_config.max_batches,
+            show_progress=True,
         )
 
         activation_meta = read_json(Path(eval_config.activation_dir).expanduser().resolve() / "meta.json")

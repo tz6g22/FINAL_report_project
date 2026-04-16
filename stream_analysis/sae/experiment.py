@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 import torch
 
 from scripts.evaluate import load_checkpoint
+from stream_analysis.path_utils import format_project_path, resolve_project_path
 
 from .analysis import (
     load_feature_stats_rows,
@@ -80,10 +81,10 @@ def _resolve_sae_runtime_context(
 
     payload_activation_dir = sae_payload.get("activation_dir")
     resolved_activation_dir = (
-        Path(activation_dir).expanduser().resolve()
+        resolve_project_path(activation_dir)
         if activation_dir is not None
         else (
-            Path(str(payload_activation_dir)).expanduser().resolve()
+            resolve_project_path(str(payload_activation_dir))
             if isinstance(payload_activation_dir, str) and payload_activation_dir.strip()
             else None
         )
@@ -105,8 +106,8 @@ def _resolve_sae_runtime_context(
         preprocessing = str(train_config.get("preprocessing", "none"))
 
     return SAERuntimeContext(
-        sae_checkpoint_path=str(Path(sae_checkpoint_path).expanduser().resolve()),
-        source_checkpoint_path=str(Path(checkpoint_path).expanduser().resolve()),
+        sae_checkpoint_path=format_project_path(sae_checkpoint_path),
+        source_checkpoint_path=format_project_path(checkpoint_path),
         activation_dir="" if resolved_activation_dir is None else str(resolved_activation_dir),
         model_type=str(merged_meta.get("model_type", "unknown")),
         checkpoint_step=merged_meta.get("checkpoint_step"),
@@ -127,8 +128,8 @@ def _validate_runtime_context(
     if model_type is not None and context.model_type != model_type:
         raise ValueError(f"SAE model_type={context.model_type!r} does not match requested model_type={model_type!r}.")
     if checkpoint_path is not None:
-        resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
-        if resolved_checkpoint != Path(context.source_checkpoint_path):
+        resolved_checkpoint = resolve_project_path(checkpoint_path)
+        if resolved_checkpoint != resolve_project_path(context.source_checkpoint_path):
             raise ValueError(
                 "Requested checkpoint does not match the checkpoint used to extract SAE activations. "
                 f"requested={resolved_checkpoint}, sae_source={context.source_checkpoint_path}"
@@ -768,16 +769,13 @@ def run_sae_checkpoint_study(
             for layer_idx in layers:
                 for site in sites:
                     sae_checkpoint_path = (
-                        Path(sae_root).expanduser().resolve()
+                        resolve_project_path(sae_root)
                         / sanitize_component(current_model_type)
                         / f"step_{format_checkpoint_step(checkpoint_step)}"
                         / f"layer_{int(layer_idx)}"
                         / sanitize_component(site)
                         / "best.pt"
                     )
-                    if not sae_checkpoint_path.is_file():
-                        raise FileNotFoundError(f"SAE checkpoint not found for checkpoint study: {sae_checkpoint_path}")
-
                     _, _, sae_payload = load_sae_checkpoint(sae_checkpoint_path, device=resolve_device(str(device)))
                     context = _resolve_sae_runtime_context(sae_checkpoint_path, sae_payload)
                     result = run_sae_feature_sweep(

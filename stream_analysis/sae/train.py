@@ -8,14 +8,11 @@ import logging
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Mapping
 
 import torch
+from accelerate import Accelerator
 from torch.utils.data import DataLoader
-try:
-    from tqdm.auto import tqdm
-except Exception:  # pragma: no cover
-    tqdm = None
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parents[1]
@@ -23,7 +20,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from .config import SAEConfig, SAETrainConfig
-from .data import ActivationShardDataset, build_activation_dataloaders
+from .data import build_activation_dataloaders
 from .eval import evaluate_sae_on_loader
 from .losses import compute_loss_dict
 from .model import TopKSAE
@@ -32,9 +29,11 @@ from .utils import (
     configure_logging,
     default_sae_checkpoint_dir,
     ensure_dir,
+    maybe_tqdm,
     read_json,
     resolve_device,
     seed_everything,
+    stage_progress,
     write_json,
 )
 
@@ -51,6 +50,38 @@ def _coerce_batch(batch: object, *, device: torch.device, dtype: torch.dtype) ->
     if batch.ndim != 2:
         raise ValueError(f"Expected [batch, d_in] activations, got {tuple(batch.shape)}.")
     return batch.to(device=device, dtype=dtype)
+
+
+def _mean_reduce(
+    values: Mapping[str, float],
+    *,
+    batch_size: int,
+    device: torch.device,
+    accelerator: Accelerator | None,
+) -> Dict[str, float]:
+    weight = float(batch_size)
+    totals = torch.tensor(
+        [
+            values["loss"] * weight,
+            values["recon_mse"] * weight,
+            values["auxk_loss"] * weight,
+            values["avg_l0"] * weight,
+            values["dead_latent_frac"] * weight,
+            weight,
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    if accelerator is not None and accelerator.num_processes > 1:
+        totals = accelerator.reduce(totals, reduction="sum")
+    denom = max(float(totals[-1].item()), 1.0)
+    return {
+        "loss": float(totals[0].item() / denom),
+        "recon_mse": float(totals[1].item() / denom),
+        "auxk_loss": float(totals[2].item() / denom),
+        "avg_l0": float(totals[3].item() / denom),
+        "dead_latent_frac": float(totals[4].item() / denom),
+    }
 
 
 class SAETrainer:
@@ -80,19 +111,26 @@ class SAETrainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         output_dir: str | Path,
-        device: torch.device,
+        device: torch.device | None = None,
         activation_metadata: Mapping[str, object] | None = None,
         activation_dir: str | Path | None = None,
+        accelerator: Accelerator | None = None,
+        show_progress: bool | None = None,
     ) -> None:
+        self.accelerator = accelerator
         self.model = model
         self.sae_config = sae_config
         self.train_config = train_config
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.output_dir = ensure_dir(output_dir)
-        self.device = device
+        self.output_dir = Path(output_dir).expanduser().resolve()
         self.activation_metadata = {} if activation_metadata is None else dict(activation_metadata)
         self.activation_dir = None if activation_dir is None else str(Path(activation_dir).expanduser().resolve())
+        self.device = accelerator.device if accelerator is not None else (
+            torch.device("cpu") if device is None else device
+        )
+        self.is_main_process = True if accelerator is None else bool(accelerator.is_main_process)
+        self.show_progress = self.is_main_process if show_progress is None else bool(show_progress)
         self.optimizer = self._build_optimizer()
         self.metrics_path = self.output_dir / train_config.metrics_filename
         self.best_val_recon_mse = math.inf
@@ -109,8 +147,47 @@ class SAETrainer:
             return torch.optim.Adam(params, **kwargs)
         return torch.optim.AdamW(params, **kwargs)
 
+    def _unwrap_model(self) -> TopKSAE:
+        if self.accelerator is None:
+            return self.model
+        return self.accelerator.unwrap_model(self.model)
+
+    def _maybe_wait(self) -> None:
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+
+    def _save_checkpoint(self, name: str, *, step: int) -> Path | None:
+        if not self.is_main_process:
+            return None
+
+        path = self.output_dir / name
+        payload = {
+            "step": step,
+            "sae_config": self.sae_config.to_dict(),
+            "train_config": self.train_config.to_dict(),
+            "model_state": self._unwrap_model().state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "best_val_recon_mse": self.best_val_recon_mse,
+            "activation_metadata": self.activation_metadata,
+            "activation_dir": self.activation_dir,
+        }
+        torch.save(payload, path)
+        return path
+
+    def _write_config(self) -> Path | None:
+        if not self.is_main_process:
+            return None
+
+        payload = {
+            "sae_config": self.sae_config.to_dict(),
+            "train_config": self.train_config.to_dict(),
+            "activation_metadata": self.activation_metadata,
+            "activation_dir": self.activation_dir,
+        }
+        return write_json(payload, self.output_dir / "config.json")
+
     def _run_train_step(self, batch: object) -> Dict[str, float]:
-        inputs = _coerce_batch(batch, device=self.device, dtype=self.model.b_pre.dtype)
+        inputs = _coerce_batch(batch, device=self.device, dtype=self._unwrap_model().b_pre.dtype)
         self.model.train()
         outputs = self.model(inputs)
         losses = compute_loss_dict(
@@ -122,20 +199,31 @@ class SAETrainer:
         )
 
         self.optimizer.zero_grad(set_to_none=True)
-        losses["loss"].backward()
-        if self.train_config.grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+        if self.accelerator is None:
+            losses["loss"].backward()
+            if self.train_config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+        else:
+            self.accelerator.backward(losses["loss"])
+            if self.train_config.grad_clip is not None:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
         self.optimizer.step()
         if self.sae_config.normalize_decoder:
-            self.model.normalize_decoder_weights()
+            self._unwrap_model().normalize_decoder_weights()
 
-        return {
+        local_metrics = {
             "loss": float(losses["loss"].item()),
             "recon_mse": float(losses["recon_mse"].item()),
             "auxk_loss": float(losses["auxk_loss"].item()),
             "avg_l0": float(losses["avg_l0"].item()),
             "dead_latent_frac": float(losses["dead_latent_frac"]),
         }
+        return _mean_reduce(
+            local_metrics,
+            batch_size=int(inputs.shape[0]),
+            device=self.device,
+            accelerator=self.accelerator,
+        )
 
     def _evaluate(self) -> Dict[str, float]:
         metrics = evaluate_sae_on_loader(
@@ -146,43 +234,30 @@ class SAETrainer:
             auxk_alpha=self.sae_config.auxk_alpha,
             dead_threshold=self.train_config.dead_threshold,
             max_batches=self.train_config.max_val_batches,
+            accelerator=self.accelerator,
+            progress_desc="sae-val",
+            show_progress=self.show_progress,
         )
         self.last_val_metrics = metrics
         return metrics
-
-    def _save_checkpoint(self, name: str, *, step: int) -> Path:
-        path = self.output_dir / name
-        payload = {
-            "step": step,
-            "sae_config": self.sae_config.to_dict(),
-            "train_config": self.train_config.to_dict(),
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "best_val_recon_mse": self.best_val_recon_mse,
-            "activation_metadata": self.activation_metadata,
-            "activation_dir": self.activation_dir,
-        }
-        torch.save(payload, path)
-        return path
-
-    def _write_config(self) -> Path:
-        payload = {
-            "sae_config": self.sae_config.to_dict(),
-            "train_config": self.train_config.to_dict(),
-            "activation_metadata": self.activation_metadata,
-            "activation_dir": self.activation_dir,
-        }
-        return write_json(payload, self.output_dir / "config.json")
 
     def train(self) -> Dict[str, Any]:
         """Run training end to end and return a summary payload."""
 
         seed_everything(self.train_config.seed)
-        self._write_config()
+        if self.is_main_process:
+            ensure_dir(self.output_dir)
+            if self.metrics_path.exists():
+                self.metrics_path.unlink()
+            self._write_config()
+        self._maybe_wait()
 
         train_iterator = iter(self.train_loader)
-        progress = tqdm(range(1, self.train_config.num_steps + 1), desc="sae-train") if tqdm else range(
-            1, self.train_config.num_steps + 1
+        progress = maybe_tqdm(
+            range(1, self.train_config.num_steps + 1),
+            desc="sae-train",
+            enabled=self.show_progress,
+            leave=False,
         )
 
         for step in progress:
@@ -200,7 +275,9 @@ class SAETrainer:
                 if val_metrics["recon_mse"] < self.best_val_recon_mse:
                     self.best_val_recon_mse = val_metrics["recon_mse"]
                     best_path = self._save_checkpoint("best.pt", step=step)
-                    logger.info("new best checkpoint at step=%d saved to %s", step, best_path)
+                    if self.is_main_process and best_path is not None:
+                        logger.info("new best checkpoint at step=%d saved to %s", step, best_path)
+                self._maybe_wait()
             else:
                 val_metrics = self.last_val_metrics or {
                     "loss": float("nan"),
@@ -224,17 +301,24 @@ class SAETrainer:
                 "val_dead_latent_frac": float(val_metrics["dead_latent_frac"]),
                 "learning_rate": float(self.optimizer.param_groups[0]["lr"]),
             }
-            append_csv_row(self.metrics_path, self.CSV_FIELDS, row)
+            if self.is_main_process:
+                append_csv_row(self.metrics_path, self.CSV_FIELDS, row)
 
             should_ckpt = step % self.train_config.checkpoint_interval == 0 or step == self.train_config.num_steps
             if should_ckpt:
                 last_path = self._save_checkpoint("last.pt", step=step)
-                logger.info("saved checkpoint at step=%d to %s", step, last_path)
+                if self.is_main_process and last_path is not None:
+                    logger.info("saved checkpoint at step=%d to %s", step, last_path)
+                self._maybe_wait()
 
-            if tqdm and hasattr(progress, "set_postfix"):
+            if hasattr(progress, "set_postfix"):
                 progress.set_postfix(
                     train_recon=f"{train_metrics['recon_mse']:.4f}",
-                    val_recon=f"{float(val_metrics['recon_mse']):.4f}" if not math.isnan(float(val_metrics["recon_mse"])) else "nan",
+                    val_recon=(
+                        f"{float(val_metrics['recon_mse']):.4f}"
+                        if not math.isnan(float(val_metrics["recon_mse"]))
+                        else "nan"
+                    ),
                 )
 
         return {
@@ -242,6 +326,126 @@ class SAETrainer:
             "best_val_recon_mse": self.best_val_recon_mse,
             "metrics_path": str(self.metrics_path),
         }
+
+
+def train_sae_from_activation_dir(
+    activation_dir: str | Path,
+    *,
+    n_latents: int,
+    k: int,
+    batch_size: int = 512,
+    num_steps: int = 10_000,
+    lr: float = 3e-4,
+    out_dir: str | Path | None = None,
+    device: str = "auto",
+    use_auxk: bool = False,
+    normalize_decoder: bool = False,
+    input_centering: bool = False,
+    input_norm: bool = False,
+    optimizer: str = "adamw",
+    weight_decay: float = 0.0,
+    eval_interval: int = 250,
+    log_interval: int = 25,
+    checkpoint_interval: int = 500,
+    val_fraction: float = 0.1,
+    seed: int = 1234,
+    num_workers: int = 0,
+    auxk_alpha: float = 0.0,
+    accelerator: Accelerator | None = None,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """Train one SAE from an activation shard directory."""
+
+    resolved_activation_dir = Path(activation_dir).expanduser().resolve()
+    with stage_progress("load activation metadata", enabled=show_progress):
+        activation_meta = read_json(resolved_activation_dir / "meta.json")
+    if not isinstance(activation_meta, Mapping):
+        raise TypeError("Activation meta.json must contain a JSON object.")
+
+    preprocessing = "none"
+    if input_centering and input_norm:
+        preprocessing = "mean-center+unit-norm"
+    elif input_centering:
+        preprocessing = "mean-center"
+    elif input_norm:
+        preprocessing = "unit-norm"
+
+    train_config = SAETrainConfig(
+        batch_size=batch_size,
+        num_steps=num_steps,
+        lr=lr,
+        optimizer=optimizer,
+        weight_decay=weight_decay,
+        eval_interval=eval_interval,
+        log_interval=log_interval,
+        checkpoint_interval=checkpoint_interval,
+        val_fraction=val_fraction,
+        seed=seed,
+        num_workers=num_workers,
+        preprocessing=preprocessing,
+        input_centering=input_centering,
+        input_norm=input_norm,
+        device=device,
+    )
+
+    device_obj = resolve_device(device) if accelerator is None else accelerator.device
+    sae_config = SAEConfig(
+        d_in=int(activation_meta["d_model"]),
+        n_latents=n_latents,
+        k=k,
+        use_auxk=use_auxk,
+        auxk_alpha=auxk_alpha,
+        normalize_decoder=normalize_decoder,
+        device=str(device_obj),
+    )
+    seed_everything(train_config.seed)
+
+    with stage_progress("build activation dataloaders", enabled=show_progress):
+        train_loader, val_loader, _, _ = build_activation_dataloaders(
+            resolved_activation_dir,
+            batch_size=train_config.batch_size,
+            val_fraction=train_config.val_fraction,
+            seed=train_config.seed,
+            preprocessing=train_config.preprocessing,
+            num_workers=train_config.num_workers,
+        )
+
+    output_dir = (
+        Path(out_dir).expanduser().resolve()
+        if out_dir is not None
+        else default_sae_checkpoint_dir(
+            str(activation_meta.get("model_type", "unknown")),
+            activation_meta.get("checkpoint_step"),
+            int(activation_meta.get("layer_idx", 0)),
+            str(activation_meta.get("site", "input")),
+        )
+    )
+    model = TopKSAE(sae_config)
+    trainer = SAETrainer(
+        model,
+        sae_config=sae_config,
+        train_config=train_config,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        output_dir=output_dir,
+        device=device_obj,
+        activation_metadata=activation_meta,
+        activation_dir=resolved_activation_dir,
+        accelerator=accelerator,
+        show_progress=show_progress if accelerator is None else show_progress and accelerator.is_main_process,
+    )
+    if accelerator is not None:
+        with stage_progress("prepare accelerate objects", enabled=show_progress and accelerator.is_main_process):
+            trainer.model, trainer.optimizer, trainer.train_loader, trainer.val_loader = accelerator.prepare(
+                trainer.model,
+                trainer.optimizer,
+                trainer.train_loader,
+                trainer.val_loader,
+            )
+        trainer.device = accelerator.device
+    else:
+        trainer.model = trainer.model.to(device_obj)
+    return trainer.train()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -276,24 +480,25 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    accelerator = Accelerator()
+
+    if not accelerator.is_main_process:
+        logging.getLogger().setLevel(logging.WARNING)
+
     try:
-        activation_dir = Path(args.activation_dir).expanduser().resolve()
-        activation_meta = read_json(activation_dir / "meta.json")
-        if not isinstance(activation_meta, Mapping):
-            raise TypeError("Activation meta.json must contain a JSON object.")
-
-        preprocessing = "none"
-        if args.input_centering and args.input_norm:
-            preprocessing = "mean-center+unit-norm"
-        elif args.input_centering:
-            preprocessing = "mean-center"
-        elif args.input_norm:
-            preprocessing = "unit-norm"
-
-        train_config = SAETrainConfig(
+        summary = train_sae_from_activation_dir(
+            args.activation_dir,
+            n_latents=args.n_latents,
+            k=args.k,
             batch_size=args.batch_size,
             num_steps=args.num_steps,
             lr=args.lr,
+            out_dir=args.out_dir or None,
+            device=args.device,
+            use_auxk=args.use_auxk,
+            normalize_decoder=args.normalize_decoder,
+            input_centering=args.input_centering,
+            input_norm=args.input_norm,
             optimizer=args.optimizer,
             weight_decay=args.weight_decay,
             eval_interval=args.eval_interval,
@@ -302,59 +507,16 @@ def main(argv: list[str] | None = None) -> int:
             val_fraction=args.val_fraction,
             seed=args.seed,
             num_workers=args.num_workers,
-            preprocessing=preprocessing,
-            input_centering=args.input_centering,
-            input_norm=args.input_norm,
-            device=args.device,
-        )
-        sae_config = SAEConfig(
-            d_in=int(activation_meta["d_model"]),
-            n_latents=args.n_latents,
-            k=args.k,
-            use_auxk=args.use_auxk,
             auxk_alpha=args.auxk_alpha,
-            normalize_decoder=args.normalize_decoder,
-            device=str(resolve_device(args.device)),
+            accelerator=accelerator,
+            show_progress=accelerator.is_main_process,
         )
-        device = resolve_device(args.device)
-
-        train_loader, val_loader, _, _ = build_activation_dataloaders(
-            activation_dir,
-            batch_size=train_config.batch_size,
-            val_fraction=train_config.val_fraction,
-            seed=train_config.seed,
-            preprocessing=train_config.preprocessing,
-            num_workers=train_config.num_workers,
-        )
-        model = TopKSAE(sae_config).to(device)
-
-        model_type = str(activation_meta.get("model_type", "unknown"))
-        checkpoint_step = activation_meta.get("checkpoint_step")
-        layer_idx = int(activation_meta.get("layer_idx", 0))
-        site = str(activation_meta.get("site", "input"))
-        output_dir = (
-            Path(args.out_dir).expanduser().resolve()
-            if args.out_dir
-            else default_sae_checkpoint_dir(model_type, checkpoint_step, layer_idx, site)
-        )
-
-        trainer = SAETrainer(
-            model,
-            sae_config=sae_config,
-            train_config=train_config,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            output_dir=output_dir,
-            device=device,
-            activation_metadata=activation_meta,
-            activation_dir=activation_dir,
-        )
-        summary = trainer.train()
     except Exception as error:
         logger.error("%s", error)
         return 1
 
-    logger.info("training finished: %s", summary)
+    if accelerator.is_main_process:
+        logger.info("training finished: %s", summary)
     return 0
 
 

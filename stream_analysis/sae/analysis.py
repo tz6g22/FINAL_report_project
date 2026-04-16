@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from scripts.evaluate import load_checkpoint
+from stream_analysis.path_utils import format_project_path, resolve_project_path
 from stream_analysis.extract_residuals import load_analysis_set
 
 from .data import preprocess_activations
@@ -464,7 +465,7 @@ def _resolve_source_metadata(
     sae_payload: Mapping[str, Any],
     activation_dir: str | Path,
 ) -> Dict[str, Any]:
-    activation_meta = read_json(Path(activation_dir).expanduser().resolve() / "meta.json")
+    activation_meta = read_json(resolve_project_path(activation_dir) / "meta.json")
     if not isinstance(activation_meta, Mapping):
         raise TypeError("activation meta.json must contain a JSON object.")
 
@@ -751,7 +752,7 @@ def run_sae_mem_analysis(
     checkpoint_step = source_meta.get("checkpoint_step")
     layer_idx = int(source_meta.get("layer_idx", 0))
     site = str(source_meta.get("site", "input"))
-    checkpoint_path = Path(str(source_meta["checkpoint_path"])).expanduser().resolve()
+    checkpoint_path = resolve_project_path(str(source_meta["checkpoint_path"]))
 
     train_config = sae_payload.get("train_config", {})
     preprocessing = "none"
@@ -816,7 +817,7 @@ def run_sae_mem_analysis(
             "site": site,
             "activation_dir": str(Path(activation_dir).expanduser().resolve()),
             "labels_source": str(Path(labels_source).expanduser().resolve()),
-            "sae_checkpoint": str(Path(sae_checkpoint).expanduser().resolve()),
+            "sae_checkpoint": format_project_path(sae_checkpoint),
             "preprocessing": preprocessing,
             "d_in": int(processed_inputs.shape[1]),
             "n_latents": sae_config.n_latents,
@@ -892,8 +893,9 @@ def run_sae_mem_analysis(
             "checkpoint_step": checkpoint_step,
             "layer_idx": layer_idx,
             "site": site,
-            "sae_checkpoint": str(Path(sae_checkpoint).expanduser().resolve()),
+            "sae_checkpoint": format_project_path(sae_checkpoint),
             "labels_source": str(Path(labels_source).expanduser().resolve()),
+            "checkpoint_path": format_project_path(checkpoint_path),
             "preprocessing": preprocessing,
         },
     )

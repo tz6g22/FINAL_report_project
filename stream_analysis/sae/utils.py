@@ -8,11 +8,16 @@ import json
 import logging
 import random
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
 
 _SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -357,3 +362,38 @@ def prepare_output_dir(
             f"Refusing to overwrite unexpected existing artifact in output directory: {child}"
         )
     return target
+
+
+def maybe_tqdm(
+    iterable: Iterable[Any] | None = None,
+    *,
+    desc: str = "",
+    total: int | None = None,
+    enabled: bool = True,
+    leave: bool = False,
+    **kwargs: Any,
+):
+    """Return a tqdm progress bar when available, else the raw iterable."""
+
+    if tqdm is None or not enabled:
+        return iterable if iterable is not None else None
+    return tqdm(iterable, desc=desc, total=total, leave=leave, dynamic_ncols=True, **kwargs)
+
+
+@contextmanager
+def stage_progress(
+    desc: str,
+    *,
+    enabled: bool = True,
+) -> Iterator[None]:
+    """Render a one-step progress bar around a long-running stage."""
+
+    bar = maybe_tqdm(desc=desc, total=1, enabled=enabled, leave=False)
+    if bar is not None:
+        bar.refresh()
+    try:
+        yield
+    finally:
+        if bar is not None:
+            bar.update(1)
+            bar.close()

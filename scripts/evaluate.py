@@ -12,6 +12,7 @@ import torch
 
 from toygpt2.config import ExperimentConfig
 from data.data import build_dataloaders
+from stream_analysis.path_utils import resolve_project_path
 from toygpt2.model import build_model
 
 
@@ -58,7 +59,8 @@ def run_evaluation(
 def load_checkpoint(checkpoint_path: str | Path, device: torch.device) -> tuple[torch.nn.Module, ExperimentConfig, Dict[str, object]]:
     """Rebuild a model from a saved checkpoint."""
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    resolved_checkpoint_path = resolve_project_path(checkpoint_path)
+    checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
     experiment = ExperimentConfig.from_dict(
         {
             "model": checkpoint["model_config"],

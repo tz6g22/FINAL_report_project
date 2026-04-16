@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from data.data import build_dataloaders
 from scripts.evaluate import load_checkpoint
+from stream_analysis.path_utils import format_project_path, resolve_project_path
 from toygpt2.model import GPTBase
 
 from .config import SAEExtractConfig
@@ -27,8 +29,10 @@ from .utils import (
     configure_logging,
     default_activation_dir,
     format_checkpoint_step,
+    maybe_tqdm,
     prepare_output_dir,
     resolve_device,
+    stage_progress,
     write_json,
 )
 
@@ -157,15 +161,21 @@ def _save_shard(path: Path, tensor: torch.Tensor, save_format: str) -> None:
     raise ValueError(f"Unsupported save_format {save_format!r}.")
 
 
-def extract_activation_shards(config: SAEExtractConfig) -> ExtractionSummary:
+def extract_activation_shards(
+    config: SAEExtractConfig,
+    *,
+    show_progress: bool = True,
+) -> ExtractionSummary:
     """Extract activation shards for one checkpoint / layer / site combination."""
 
-    checkpoint_path = Path(config.checkpoint_path).expanduser().resolve()
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = resolve_project_path(config.checkpoint_path)
 
     device = resolve_device(config.device)
-    model, experiment, checkpoint = load_checkpoint(checkpoint_path, device=device)
+    with stage_progress(
+        f"[{config.model_type}] load checkpoint ({config.dataset_split})",
+        enabled=show_progress,
+    ):
+        model, experiment, checkpoint = load_checkpoint(checkpoint_path, device=device)
     ckpt_model_type = str(checkpoint.get("model_type", getattr(experiment.model, "model_type", "unknown")))
     if ckpt_model_type != config.model_type:
         raise ValueError(
@@ -178,16 +188,24 @@ def extract_activation_shards(config: SAEExtractConfig) -> ExtractionSummary:
         if config.out_dir
         else default_activation_dir(config.model_type, checkpoint_step, config.layer_idx, config.site)
     )
-    prepare_output_dir(output_dir, overwrite=config.overwrite)
+    with stage_progress(
+        f"[{config.model_type}] prepare output ({config.dataset_split})",
+        enabled=show_progress,
+    ):
+        prepare_output_dir(output_dir, overwrite=config.overwrite)
 
-    train_loader, val_loader = build_dataloaders(
-        model_config=experiment.model,
-        data_config=experiment.data,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        seed=experiment.train.seed,
-        verbose=True,
-    )
+    with stage_progress(
+        f"[{config.model_type}] build dataloader ({config.dataset_split})",
+        enabled=show_progress,
+    ):
+        train_loader, val_loader = build_dataloaders(
+            model_config=experiment.model,
+            data_config=experiment.data,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            seed=experiment.train.seed,
+            verbose=True,
+        )
     dataloader = train_loader if config.dataset_split == "train" else val_loader
 
     extractor = BlockInputExtractor(
@@ -236,7 +254,20 @@ def extract_activation_shards(config: SAEExtractConfig) -> ExtractionSummary:
         output_dir,
     )
 
-    for batch_index, (inputs, _) in enumerate(dataloader):
+    approx_batch_tokens = max(1, config.batch_size * int(getattr(experiment.model, "block_size", 1)))
+    estimated_batches = len(dataloader)
+    if config.max_tokens is not None:
+        estimated_batches = min(estimated_batches, math.ceil(config.max_tokens / approx_batch_tokens))
+
+    batch_iterator = maybe_tqdm(
+        enumerate(dataloader),
+        desc=f"[{config.model_type}] extract {config.dataset_split}",
+        total=estimated_batches,
+        enabled=show_progress,
+        leave=False,
+    )
+
+    for batch_index, (inputs, _) in batch_iterator:
         logger.debug("processing batch %d", batch_index)
         activations = extractor.extract_batch(inputs)
         if config.max_tokens is not None:
@@ -266,7 +297,7 @@ def extract_activation_shards(config: SAEExtractConfig) -> ExtractionSummary:
         "format_version": "1.0.0",
         "artifact_type": "sae_activation_shards",
         "model_type": config.model_type,
-        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_path": format_project_path(checkpoint_path),
         "checkpoint_step": checkpoint_step,
         "layer_idx": config.layer_idx,
         "site": config.site,

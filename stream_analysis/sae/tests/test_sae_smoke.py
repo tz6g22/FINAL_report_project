@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stream_analysis.sae.config import SAEConfig, SAEExtractConfig, SAETrainConfig
+from stream_analysis.path_utils import format_project_path, project_root, resolve_project_path
 from stream_analysis.sae.data import ActivationShardDataset, build_activation_dataloaders
 from stream_analysis.sae.eval import SAEEvaluator, load_sae_checkpoint, save_evaluation_results
 from stream_analysis.sae.extract import extract_activation_shards
@@ -19,6 +20,13 @@ from stream_analysis.sae.model import TopKSAE
 from stream_analysis.sae.train import SAETrainer
 from toygpt2.config import DataConfig, ExperimentConfig, ModelConfig, TrainConfig
 from toygpt2.model import build_model
+
+
+def test_checkpoint_path_resolution_uses_repo_relative_style() -> None:
+    relative = Path("toygpt2_runs/tinystories_dual/standard/ckpt_standard_last.pt")
+    resolved = resolve_project_path(relative)
+    assert resolved == project_root() / relative
+    assert format_project_path(relative) == str(relative)
 
 
 def _save_tiny_checkpoint(root: Path, *, model_type: str = "standard") -> Path:
