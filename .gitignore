@@ -10,7 +10,7 @@ __pycache__
 *.jsonl
 *.png
 *.md
-
+*.csv
 example/
 toygpt2_runs/
 toygpt2_cache
