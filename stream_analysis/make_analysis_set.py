@@ -14,7 +14,7 @@ Usage example
 -------------
 ::
 
-    python analysis/make_analysis_set.py \\
+    python stream_analysis/make_analysis_set.py \\
         --checkpoint-config toygpt2_runs/tinystories_dual/standard/config.json \\
         --split val \\
         --num-samples 64 \\

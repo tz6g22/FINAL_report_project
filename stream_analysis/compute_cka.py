@@ -41,18 +41,18 @@ Usage examples
 --------------
 ::
 
-    python analysis/compute_cka.py \\
+    python stream_analysis/compute_cka.py \\
       --artifact-a artifacts/activations/standard_last_target.pt \\
       --mode within \\
       --output artifacts/cka/standard_last_within.pt
 
-    python analysis/compute_cka.py \\
+    python stream_analysis/compute_cka.py \\
       --artifact-a artifacts/activations/standard_last_target.pt \\
       --artifact-b artifacts/activations/attnres_last_target.pt \\
       --mode cross_same_layer \\
       --output artifacts/cka/standard_vs_attnres_same_layer.pt
 
-    python analysis/compute_cka.py \\
+    python stream_analysis/compute_cka.py \\
       --artifact-a artifacts/activations/standard_step1000_target.pt \\
       --artifact-b artifacts/activations/standard_step2000_target.pt \\
       --mode cross_same_layer \\

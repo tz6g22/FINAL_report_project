@@ -18,4 +18,4 @@ toygpt2_cache
 readme.md
 .idea/
 .claude
-
+artifacts/
